@@ -12,9 +12,9 @@ public class FileStorage
     private uint iCuttOff;
     private readonly ConcurrentDictionary<Guid, byte> _ActiveFiles = new ConcurrentDictionary<Guid, byte>();
 
-    public FileStorage(string sStoragePath, uint iEveryHours = 1)
+    public FileStorage(string sStoragePath, uint DeleteEveryHours = 1)
     {
-        iCuttOff = iEveryHours;
+        iCuttOff = DeleteEveryHours;
         if (string.IsNullOrWhiteSpace(sStoragePath))
             throw new ArgumentNullException(nameof(sStoragePath));
 
