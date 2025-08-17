@@ -9,12 +9,12 @@ public class FileStorage
     private readonly string _StoragePath;
     private DateTime _LastCleanup = DateTime.UtcNow;
     private int _CleanupFlag;
-    private uint iCuttOff;
+    private uint _CutOffTime;
     private readonly ConcurrentDictionary<Guid, byte> _ActiveFiles = new ConcurrentDictionary<Guid, byte>();
 
     public FileStorage(string sStoragePath, uint DeleteEveryHours = 1)
     {
-        iCuttOff = DeleteEveryHours;
+        _CutOffTime = DeleteEveryHours;
         if (string.IsNullOrWhiteSpace(sStoragePath))
             throw new ArgumentNullException(nameof(sStoragePath));
 
@@ -107,7 +107,7 @@ public class FileStorage
 
     private void TriggerLazyCleanup()
     {
-        if ((DateTime.UtcNow - _LastCleanup) <= TimeSpan.FromHours(iCuttOff))
+        if ((DateTime.UtcNow - _LastCleanup) <= TimeSpan.FromHours(_CutOffTime))
             return;
 
         ForceCleanup();
@@ -116,7 +116,7 @@ public class FileStorage
     private void CleanupOldFiles()
     {
         _LastCleanup = DateTime.UtcNow;
-        var dCutoff = DateTime.UtcNow.AddHours(iCuttOff * -1);
+        var dCutoff = DateTime.UtcNow.AddHours(_CutOffTime * -1);
 
         try
         {
