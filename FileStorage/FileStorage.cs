@@ -55,6 +55,38 @@ public sealed class FileStorage : IDisposable
         TriggerLazyCleanup();
         return oFileId;
     }
+    public Guid SaveFile(Stream oFileStream)
+    {
+        if (oFileStream == null)
+            throw new ArgumentNullException(nameof(oFileStream));
+
+        var oFileId = Guid.NewGuid();
+        var sFilePath = GetFilePath(oFileId);
+        try
+        {
+            _ActiveFiles[oFileId] = 0;
+            ExecuteWithRetry(() =>
+            {
+                using (var oFileStreamOnDisk = new FileStream(
+                    sFilePath,
+                    FileMode.CreateNew,
+                    FileAccess.Write,
+                    FileShare.None,
+                    bufferSize: 81920,
+                    FileOptions.Asynchronous | FileOptions.SequentialScan))
+                {
+                    oFileStream.CopyTo(oFileStreamOnDisk);
+                }
+            });
+        }
+        finally
+        {
+            _ActiveFiles.TryRemove(oFileId, out _);
+        }
+
+        TriggerLazyCleanup();
+        return oFileId;
+    }
     public async Task<Guid> SaveFileAsync(byte[] oFileData, string sBase64 = null)
     {
         if ((oFileData == null || oFileData.Length == 0) && string.IsNullOrEmpty(sBase64))
@@ -77,6 +109,38 @@ public sealed class FileStorage : IDisposable
                     FileOptions.Asynchronous | FileOptions.SequentialScan))
                 {
                     await oFs.WriteAsync(oFileData, 0, oFileData.Length);
+                }
+            });
+        }
+        finally
+        {
+            _ActiveFiles.TryRemove(oFileId, out _);
+        }
+
+        TriggerLazyCleanup();
+        return oFileId;
+    }
+    public async Task<Guid> SaveFileAsync(Stream oFileStream)
+    {
+        if (oFileStream == null)
+            throw new ArgumentNullException(nameof(oFileStream));
+
+        var oFileId = Guid.NewGuid();
+        var sFilePath = GetFilePath(oFileId);
+        try
+        {
+            _ActiveFiles[oFileId] = 0;
+            await ExecuteWithRetryAsync(async () =>
+            {
+                using (var oFileStreamOnDisk = new FileStream(
+                    sFilePath,
+                    FileMode.CreateNew,
+                    FileAccess.Write,
+                    FileShare.None,
+                    bufferSize: 81920,
+                    FileOptions.Asynchronous | FileOptions.SequentialScan))
+                {
+                    await oFileStream.CopyToAsync(oFileStreamOnDisk);
                 }
             });
         }
@@ -204,8 +268,7 @@ public sealed class FileStorage : IDisposable
             LogError("Global cleanup error", ex);
         }
     }
-    private string GetFilePath(Guid oFileId) =>
-        Path.Combine(_StoragePath, oFileId.ToString("N") + ".tmp");
+    private string GetFilePath(Guid oFileId) => Path.Combine(_StoragePath, oFileId.ToString("N") + ".tmp");
     private T ExecuteWithRetry<T>(Func<T> oFunc, int iMaxRetries = 5, int iBaseDelay = 20)
     {
         var rnd = new Random();
