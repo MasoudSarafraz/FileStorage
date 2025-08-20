@@ -26,9 +26,9 @@ public sealed class FileStorage2 : IDisposable
         this._DeleteEveryHours = iDeleteEveryHours;
 
         Directory.CreateDirectory(sPath);
-
-        var iIntervalMs = (int)TimeSpan.FromHours(iDeleteEveryHours).TotalMilliseconds;
-        this._CleanupTimer = new Timer(OnCleanupTimer, null, iIntervalMs, iIntervalMs);
+        var oDelay = TimeSpan.FromHours(iDeleteEveryHours);
+        var iMs = (int)Math.Min((long)oDelay.TotalMilliseconds, int.MaxValue);
+        this._CleanupTimer = new Timer(OnCleanupTimer, null, iMs, iMs);
     }
 
     public Guid SaveFile(byte[] oFileData, string sBase64 = null)
@@ -57,13 +57,11 @@ public sealed class FileStorage2 : IDisposable
                     oFs.Write(oFileData, 0, oFileData.Length);
                 }
 
-                // تغییر نام اتمیک — بدون کپی داده، بسیار سریع
                 File.Move(sTempPath, sFinalPath);
             });
         }
         catch
         {
-            // پاک‌کردن فایل موقت در صورت خطا
             try { if (File.Exists(sTempPath)) File.Delete(sTempPath); } catch { }
             DecrementRef(oFileId);
             throw;
@@ -190,73 +188,36 @@ public sealed class FileStorage2 : IDisposable
     public Stream GetFile(Guid oFileId)
     {
         var sFilePath = GetFilePath(oFileId);
-
         if (!File.Exists(sFilePath))
             throw new FileNotFoundException("File not found.", sFilePath);
 
-        IncrementRef(oFileId);
-        try
-        {
-            ExecuteWithRetry(() =>
-            {
-                using (var oFs = new FileStream(sFilePath, FileMode.Open, FileAccess.Read, FileShare.Read | FileShare.Delete))
-                {
-                    // فقط بررسی دسترسی
-                }
-            });
-
-            return new FileStream(
-                sFilePath,
-                FileMode.Open,
-                FileAccess.Read,
-                FileShare.Read | FileShare.Delete,
-                bufferSize: 81920,
-                useAsync: true);
-        }
-        catch
-        {
-            DecrementRef(oFileId);
-            throw;
-        }
+        return new FileStream(
+            sFilePath,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.Read | FileShare.Delete,
+            bufferSize: 81920,
+            useAsync: true);
     }
 
     public async Task<Stream> GetFileAsync(Guid oFileId, CancellationToken oCt = default(CancellationToken))
     {
         var sFilePath = GetFilePath(oFileId);
-
         if (!File.Exists(sFilePath))
             throw new FileNotFoundException("File not found.", sFilePath);
 
-        IncrementRef(oFileId);
-        try
-        {
-            await ExecuteWithRetryAsync(async () =>
-            {
-                using (var oFs = new FileStream(sFilePath, FileMode.Open, FileAccess.Read, FileShare.Read | FileShare.Delete))
-                {
-                    // فقط بررسی دسترسی
-                }
-            }, oCt).ConfigureAwait(false);
-
-            return new FileStream(
-                sFilePath,
-                FileMode.Open,
-                FileAccess.Read,
-                FileShare.Read | FileShare.Delete,
-                bufferSize: 81920,
-                useAsync: true);
-        }
-        catch
-        {
-            DecrementRef(oFileId);
-            throw;
-        }
+        return new FileStream(
+            sFilePath,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.Read | FileShare.Delete,
+            bufferSize: 81920,
+            useAsync: true);
     }
 
     public byte[] GetFileBytes(Guid oFileId)
     {
         var sFilePath = GetFilePath(oFileId);
-
         if (!File.Exists(sFilePath))
             throw new FileNotFoundException("File not found.", sFilePath);
 
@@ -294,7 +255,6 @@ public sealed class FileStorage2 : IDisposable
     public async Task<byte[]> GetFileBytesAsync(Guid oFileId, CancellationToken oCt = default(CancellationToken))
     {
         var sFilePath = GetFilePath(oFileId);
-
         if (!File.Exists(sFilePath))
             throw new FileNotFoundException("File not found.", sFilePath);
 
@@ -365,6 +325,7 @@ public sealed class FileStorage2 : IDisposable
                         if (!Guid.TryParse(sFileName, out var oFileId))
                             continue;
 
+                        // اگر فایل در حال استفاده (در Save) باشد، حذف نشود
                         if (_ActiveRefs.ContainsKey(oFileId))
                             continue;
 
