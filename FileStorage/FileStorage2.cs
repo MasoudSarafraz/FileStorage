@@ -150,12 +150,11 @@ public sealed class FileStorage2 : IDisposable
             throw new ArgumentNullException(nameof(oFileStream));
 
 
-
+        //
         EnsureDiskSpace(oFileStream.Length);
         var oFileId = Guid.NewGuid();
         var sTempPath = GetTempPath(oFileId);
         var sFinalPath = GetFilePath(oFileId);
-
         IncrementRef(oFileId);
         try
         {
@@ -190,7 +189,6 @@ public sealed class FileStorage2 : IDisposable
         var sFilePath = GetFilePath(oFileId);
         if (!File.Exists(sFilePath))
             throw new FileNotFoundException("File not found.", sFilePath);
-
         return new FileStream(
             sFilePath,
             FileMode.Open,
@@ -206,7 +204,6 @@ public sealed class FileStorage2 : IDisposable
         var sFilePath = GetFilePath(oFileId);
         if (!File.Exists(sFilePath))
             throw new FileNotFoundException("File not found.", sFilePath);
-
         return new FileStream(
             sFilePath,
             FileMode.Open,
@@ -222,12 +219,9 @@ public sealed class FileStorage2 : IDisposable
         var sFilePath = GetFilePath(oFileId);
         if (!File.Exists(sFilePath))
             throw new FileNotFoundException("File not found.", sFilePath);
-
         var iFileSize = new FileInfo(sFilePath).Length;
         if (iFileSize > MaxFileSize)
             throw new IOException($"File is too large to load into memory (max {MaxFileSize} bytes).");
-
-
         IncrementRef(oFileId);
         try
         {
@@ -267,7 +261,6 @@ public sealed class FileStorage2 : IDisposable
         var iFileSize = new FileInfo(sFilePath).Length;
         if (iFileSize > MaxFileSize)
             throw new IOException($"File is too large to load into memory (max {MaxFileSize} bytes).");
-
         IncrementRef(oFileId);
         try
         {
@@ -295,11 +288,10 @@ public sealed class FileStorage2 : IDisposable
         }
     }
 
-    private void OnCleanupTimer(object state)
+    private void OnCleanupTimer(object oState)
     {
         if (Interlocked.CompareExchange(ref _CleanupRunning, 1, 0) != 0)
             return;
-
         _CleanupCompleted.Reset();
         try
         {
@@ -318,23 +310,22 @@ public sealed class FileStorage2 : IDisposable
 
     private void CleanupOldFiles()
     {
-        var cutoff = DateTime.UtcNow - TimeSpan.FromHours(_DeleteEveryHours);
+        var oCutoff = DateTime.UtcNow - TimeSpan.FromHours(_DeleteEveryHours);
         try
         {
-            var dirInfo = new DirectoryInfo(_StoragePath);
+            var oDirInfo = new DirectoryInfo(_StoragePath);
 
-            foreach (var fileInfo in dirInfo.GetFiles("*.dat"))
+            foreach (var fileInfo in oDirInfo.GetFiles("*.dat"))
             {
                 try
                 {
                     var fileName = Path.GetFileNameWithoutExtension(fileInfo.Name);
                     if (!Guid.TryParseExact(fileName, "N", out var fileId))
                         continue;
-
                     if (_ActiveRefs.ContainsKey(fileId))
                         continue;
 
-                    if (fileInfo.CreationTimeUtc < cutoff)
+                    if (fileInfo.CreationTimeUtc < oCutoff)
                     {
                         SafeDeleteFile(fileInfo.FullName);
                     }
@@ -344,14 +335,13 @@ public sealed class FileStorage2 : IDisposable
                     LogError("Error during file cleanup", ex);
                 }
             }
-
-            foreach (var fileInfo in dirInfo.GetFiles("*.tmp"))
+            foreach (var oFileInfo in oDirInfo.GetFiles("*.tmp"))
             {
                 try
                 {
-                    if (fileInfo.CreationTimeUtc < cutoff)
+                    if (oFileInfo.CreationTimeUtc < oCutoff)
                     {
-                        SafeDeleteFile(fileInfo.FullName);
+                        SafeDeleteFile(oFileInfo.FullName);
                     }
                 }
                 catch (Exception ex)
@@ -439,10 +429,10 @@ public sealed class FileStorage2 : IDisposable
         Debug.WriteLine($"{sMessage}: {oEx.Message}");
     }
 
-    private void EnsureDiskSpace(long requiredSpace)
+    private void EnsureDiskSpace(long lRequiredSpace)
     {
         var driveInfo = new DriveInfo(Path.GetPathRoot(_StoragePath));
-        if (driveInfo.AvailableFreeSpace < requiredSpace * 1.1) // 10% buffer
+        if (driveInfo.AvailableFreeSpace < lRequiredSpace * 1.1) // 10% buffer
             throw new IOException("Not enough disk space available.");
     }
 
