@@ -13,11 +13,12 @@ public sealed class FileStorage2 : IDisposable
     private readonly Timer _CleanupTimer;
     private readonly ManualResetEventSlim _CleanupCompleted = new ManualResetEventSlim(true);
     private readonly object _cleanupLock = new object();
+    private readonly double _FreeSpaceBufferRatio = 0.1; // 10% buffer for disk space
     private int _CleanupRunning;
     private int _Disposed;
     private static readonly ThreadLocal<Random> _Random = new ThreadLocal<Random>(() => new Random(Guid.NewGuid().GetHashCode()));
-    private const int BufferSize = 16384;// 16KB
-    private const long MaxFileSize = 100 * 1024 * 1024;// 100 MB
+    private const int BufferSize = 16384; // 16KB
+    private const long MaxFileSize = 100 * 1024 * 1024; // 100 MB
 
     public FileStorage2(string sPath, uint iDeleteEveryHours = 1)
     {
@@ -194,48 +195,41 @@ public sealed class FileStorage2 : IDisposable
     {
         CheckDisposed();
         var sFilePath = GetFilePath(oFileId);
-        if (!File.Exists(sFilePath))
-            throw new FileNotFoundException("File not found.", sFilePath);
-        return new FileStream(
-            sFilePath,
-            FileMode.Open,
-            FileAccess.Read,
-            FileShare.Read | FileShare.Delete,
-            BufferSize,
-            false);
+        try
+        {
+            return new FileStream(
+                sFilePath,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.Read | FileShare.Delete,
+                BufferSize,
+                false);
+        }
+        catch (FileNotFoundException ex)
+        {
+            throw new FileNotFoundException("File not found.", sFilePath, ex);
+        }
     }
 
-    //public async Task<Stream> GetFileAsync(Guid oFileId, CancellationToken oCt = default(CancellationToken))
-    //{
-    //    CheckDisposed();
-    //    var sFilePath = GetFilePath(oFileId);
-    //    if (!File.Exists(sFilePath))
-    //        throw new FileNotFoundException("File not found.", sFilePath);
-    //    return new FileStream(
-    //        sFilePath,
-    //        FileMode.Open,
-    //        FileAccess.Read,
-    //        FileShare.Read | FileShare.Delete,
-    //        BufferSize,
-    //        true);
-    //}
     public async Task<Stream> GetFileAsync(Guid oFileId, CancellationToken oCt = default(CancellationToken))
     {
         CheckDisposed();
         oCt.ThrowIfCancellationRequested();
         var sFilePath = GetFilePath(oFileId);
-        bool bExists = await Task.Run(() => File.Exists(sFilePath), oCt).ConfigureAwait(false);
-
-        if (!bExists)
-            throw new FileNotFoundException("File not found.", sFilePath);
-
-        return new FileStream(
-            sFilePath,
-            FileMode.Open,
-            FileAccess.Read,
-            FileShare.Read | FileShare.Delete,
-            BufferSize,
-            true);
+        try
+        {
+            return await Task.Run(() => new FileStream(
+                sFilePath,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.Read | FileShare.Delete,
+                BufferSize,
+                true), oCt).ConfigureAwait(false);
+        }
+        catch (FileNotFoundException ex)
+        {
+            throw new FileNotFoundException("File not found.", sFilePath, ex);
+        }
     }
 
     public byte[] GetFileBytes(Guid oFileId)
@@ -361,7 +355,7 @@ public sealed class FileStorage2 : IDisposable
                         if (!Guid.TryParseExact(sFileName, "N", out var oFileId))
                             continue;
 
-                        if (_ActiveRefs.ContainsKey(oFileId))
+                        if (_ActiveRefs.TryGetValue(oFileId, out int iCount) && iCount > 0)
                             continue;
 
                         if (oFileInfo.CreationTimeUtc < oCutoff)
@@ -405,7 +399,12 @@ public sealed class FileStorage2 : IDisposable
     private void DecrementRef(Guid oFileId)
     {
         _ActiveRefs.AddOrUpdate(oFileId, 0, (key, value) => value > 0 ? value - 1 : 0);
-        // فقط اگر مقدار 0 بود و حذف شد — نیازی به اقدام اضافه نیست
+
+        // حذف کلید اگر مقدار به صفر رسید
+        if (_ActiveRefs.TryGetValue(oFileId, out int iCount) && iCount == 0)
+        {
+            _ActiveRefs.TryRemove(oFileId, out _);
+        }
     }
 
     private T ExecuteWithRetry<T>(Func<T> oFunc, int iMaxRetries = 5, int iBaseDelay = 20)
@@ -465,7 +464,8 @@ public sealed class FileStorage2 : IDisposable
     private void EnsureDiskSpace(long lRequiredSpace)
     {
         var oDriveInfo = new DriveInfo(Path.GetPathRoot(_StoragePath));
-        if (oDriveInfo.AvailableFreeSpace < lRequiredSpace * 1.1)
+        long lRequiredWithBuffer = (long)(lRequiredSpace * (1 + _FreeSpaceBufferRatio));
+        if (oDriveInfo.AvailableFreeSpace < lRequiredWithBuffer)
             throw new IOException("Not enough disk space available.");
     }
 
@@ -476,9 +476,13 @@ public sealed class FileStorage2 : IDisposable
             if (File.Exists(sPath))
                 File.Delete(sPath);
         }
-        catch (Exception ex)
+        catch (IOException ex)
         {
             Debug.WriteLine($"Error deleting file: {ex.Message}");
+        }
+        catch (UnauthorizedAccessException ex)
+        {
+            Debug.WriteLine($"Access denied deleting file: {ex.Message}");
         }
     }
 
