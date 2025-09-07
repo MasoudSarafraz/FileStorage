@@ -14,7 +14,7 @@ public sealed class FileStorage : IDisposable
     private readonly ManualResetEventSlim _CleanupCompleted = new ManualResetEventSlim(true);
     private readonly object _CleanupLock = new object();
     private readonly object _RefLock = new object();
-    private readonly double _FreeSpaceBufferRatio = 0.1;
+    private readonly double _FreeSpaceBufferRatio = 0.1;//جهت در نظر گرفتن 10% فضای بیشتر برای ذخیره فایل
     private int _CleanupRunning;
     private int _Disposed;
     private static readonly ThreadLocal<Random> _Random = new ThreadLocal<Random>(() => new Random(Guid.NewGuid().GetHashCode()));
