@@ -12,14 +12,14 @@ public sealed class FileStorage : IDisposable
     private readonly ConcurrentDictionary<Guid, int> _ActiveRefs = new ConcurrentDictionary<Guid, int>();
     private readonly Timer _CleanupTimer;
     private readonly ManualResetEventSlim _CleanupCompleted = new ManualResetEventSlim(true);
-    private readonly object _cleanupLock = new object();
-    private readonly object _refLock = new object();
+    private readonly object _CleanupLock = new object();
+    private readonly object _RefLock = new object();
     private readonly double _FreeSpaceBufferRatio = 0.1;
     private int _CleanupRunning;
     private int _Disposed;
     private static readonly ThreadLocal<Random> _Random = new ThreadLocal<Random>(() => new Random(Guid.NewGuid().GetHashCode()));
-    private const int DefaultBufferSize = 8192;
-    private const long MaxFileSize = 100 * 1024 * 1024;
+    private const int _DefaultBufferSize = 8192;
+    private const long _MaxFileSize = 100 * 1024 * 1024;
     private readonly DriveInfo _DriveInfo;
 
     public FileStorage(string sPath, uint iDeleteEveryHours = 1)
@@ -101,14 +101,14 @@ public sealed class FileStorage : IDisposable
         }
         else
         {
-            EnsureDiskSpace(MaxFileSize);
+            EnsureDiskSpace(_MaxFileSize);
         }
 
         var oFileId = Guid.NewGuid();
         var sTempPath = GetTempPath(oFileId);
         var sFinalPath = GetFilePath(oFileId);
 
-        int iBufferSize = oFileStream.CanSeek ? GetOptimaizBufferSize(lFileSize) : DefaultBufferSize;
+        int iBufferSize = oFileStream.CanSeek ? GetOptimaizBufferSize(lFileSize) : _DefaultBufferSize;
 
         IncrementRef(oFileId);
         try
@@ -194,14 +194,14 @@ public sealed class FileStorage : IDisposable
         }
         else
         {
-            EnsureDiskSpace(MaxFileSize);
+            EnsureDiskSpace(_MaxFileSize);
         }
 
         var oFileId = Guid.NewGuid();
         var sTempPath = GetTempPath(oFileId);
         var sFinalPath = GetFilePath(oFileId);
 
-        int iBufferSize = oFileStream.CanSeek ? GetOptimaizBufferSize(lFileSize) : DefaultBufferSize;
+        int iBufferSize = oFileStream.CanSeek ? GetOptimaizBufferSize(lFileSize) : _DefaultBufferSize;
 
         IncrementRef(oFileId);
         try
@@ -242,7 +242,7 @@ public sealed class FileStorage : IDisposable
                 FileMode.Open,
                 FileAccess.Read,
                 FileShare.Read | FileShare.Delete,
-                DefaultBufferSize,
+                _DefaultBufferSize,
                 FileOptions.RandomAccess | FileOptions.SequentialScan);
         }
         catch (FileNotFoundException ex)
@@ -267,7 +267,7 @@ public sealed class FileStorage : IDisposable
                 FileMode.Open,
                 FileAccess.Read,
                 FileShare.Read | FileShare.Delete,
-                DefaultBufferSize,
+                _DefaultBufferSize,
                 FileOptions.Asynchronous | FileOptions.SequentialScan);
         }
         catch (FileNotFoundException ex)
@@ -285,8 +285,8 @@ public sealed class FileStorage : IDisposable
             throw new FileNotFoundException("File not found.", sFilePath);
 
         var iFileSize = new FileInfo(sFilePath).Length;
-        if (iFileSize > MaxFileSize)
-            throw new IOException($"File is too large to load into memory (max {MaxFileSize} bytes).");
+        if (iFileSize > _MaxFileSize)
+            throw new IOException($"File is too large to load into memory (max {_MaxFileSize} bytes).");
 
         IncrementRef(oFileId);
         try
@@ -330,8 +330,8 @@ public sealed class FileStorage : IDisposable
             throw new FileNotFoundException("File not found.", sFilePath);
 
         var iFileSize = new FileInfo(sFilePath).Length;
-        if (iFileSize > MaxFileSize)
-            throw new IOException($"File is too large to load into memory (max {MaxFileSize} bytes).");
+        if (iFileSize > _MaxFileSize)
+            throw new IOException($"File is too large to load into memory (max {_MaxFileSize} bytes).");
 
         IncrementRef(oFileId);
         try
@@ -389,7 +389,7 @@ public sealed class FileStorage : IDisposable
 
     private void CleanupOldFiles()
     {
-        lock (_cleanupLock)
+        lock (_CleanupLock)
         {
             var oCutoff = DateTime.UtcNow - TimeSpan.FromHours(_DeleteEveryHours);
             try
@@ -441,7 +441,7 @@ public sealed class FileStorage : IDisposable
 
     private void IncrementRef(Guid oFileId)
     {
-        lock (_refLock)
+        lock (_RefLock)
         {
             _ActiveRefs.AddOrUpdate(oFileId, 1, (key, value) => value + 1);
         }
@@ -449,7 +449,7 @@ public sealed class FileStorage : IDisposable
 
     private void DecrementRef(Guid oFileId)
     {
-        lock (_refLock)
+        lock (_RefLock)
         {
             int newCount = _ActiveRefs.AddOrUpdate(oFileId, 0, (key, value) => value > 0 ? value - 1 : 0);
             if (newCount == 0)
@@ -526,7 +526,7 @@ public sealed class FileStorage : IDisposable
         }
         catch (FileNotFoundException)
         {
-            /* ignore */
+            // No Matter
         }
         catch (IOException ex)
         {
