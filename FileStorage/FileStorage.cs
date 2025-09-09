@@ -83,7 +83,7 @@ public sealed class FileStorage : IDisposable
         }
         return oFileId;
     }
-    public Guid SaveFile(string sBase64 = null)
+    public Guid SaveFile(string sBase64)
     {
         CheckDisposed();
         if (string.IsNullOrEmpty(sBase64))
