@@ -45,15 +45,12 @@ public sealed class FileStorage : IDisposable
         return 65536;
     }
 
-    public Guid SaveFile(byte[] oFileData, string sBase64 = null)
+    public Guid SaveFile(byte[] oFileData)
     {
         CheckDisposed();
-        if ((oFileData == null || oFileData.Length == 0) && string.IsNullOrEmpty(sBase64))
+        if ((oFileData == null || oFileData.Length == 0))
             throw new ArgumentException("File data is empty");
-
-        oFileData = oFileData ?? Convert.FromBase64String(sBase64);
         EnsureDiskSpace(oFileData.Length);
-
         var oFileId = Guid.NewGuid();
         var sTempPath = GetTempPath(oFileId);
         var sFinalPath = GetFilePath(oFileId);
@@ -86,6 +83,55 @@ public sealed class FileStorage : IDisposable
         }
         return oFileId;
     }
+    public Guid SaveFile(string sBase64 = null)
+    {
+        CheckDisposed();
+        if (string.IsNullOrEmpty(sBase64))
+            throw new ArgumentException("File data is empty");
+        var oFileData = Convert.FromBase64String(sBase64);
+        return SaveFile(oFileData);
+    }
+    //public Guid SaveFile(byte[] oFileData, string sBase64 = null)
+    //{
+    //    CheckDisposed();
+    //    if ((oFileData == null || oFileData.Length == 0) && string.IsNullOrEmpty(sBase64))
+    //        throw new ArgumentException("File data is empty");
+
+    //    oFileData = oFileData ?? Convert.FromBase64String(sBase64);
+    //    EnsureDiskSpace(oFileData.Length);
+
+    //    var oFileId = Guid.NewGuid();
+    //    var sTempPath = GetTempPath(oFileId);
+    //    var sFinalPath = GetFilePath(oFileId);
+
+    //    int iBufferSize = GetOptimaizBufferSize(oFileData.Length);
+
+    //    IncrementRef(oFileId);
+    //    try
+    //    {
+    //        ExecuteWithRetry(() =>
+    //        {
+    //            using (var oFs = new FileStream(
+    //                sTempPath,
+    //                FileMode.CreateNew,
+    //                FileAccess.Write,
+    //                FileShare.None,
+    //                iBufferSize,
+    //                FileOptions.SequentialScan))
+    //            {
+    //                oFs.Write(oFileData, 0, oFileData.Length);
+    //            }
+    //            File.Move(sTempPath, sFinalPath);
+    //        });
+    //    }
+    //    catch
+    //    {
+    //        SafeDeleteFile(sTempPath);
+    //        DecrementRef(oFileId);
+    //        throw;
+    //    }
+    //    return oFileId;
+    //}
 
     public Guid SaveFile(Stream oFileStream)
     {
