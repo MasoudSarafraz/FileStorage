@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.IO;
@@ -36,14 +36,6 @@ public sealed class FileStorage : IDisposable
         var iMs = (int)Math.Min((long)oDelay.TotalMilliseconds, int.MaxValue);
         _CleanupTimer = new Timer(OnCleanupTimer, null, iMs, iMs);
     }
-
-    private int GetOptimaizBufferSize(long lFileSize)
-    {
-        if (lFileSize <= 8192) return 8192;
-        if (lFileSize <= 65536) return 16384;
-        if (lFileSize <= 524288) return 32768;
-        return 65536;
-    }
     public Guid SaveFile(Stream oFileStream)
     {
         return SaveFileCore(oFileStream);
@@ -68,192 +60,28 @@ public sealed class FileStorage : IDisposable
         var oFileData = Convert.FromBase64String(sBase64);
         return SaveFile(oFileData);
     }
-    //public Guid SaveFile(byte[] oFileData, string sBase64 = null)
-    //{
-    //    CheckDisposed();
-    //    if ((oFileData == null || oFileData.Length == 0) && string.IsNullOrEmpty(sBase64))
-    //        throw new ArgumentException("File data is empty");
-
-    //    oFileData = oFileData ?? Convert.FromBase64String(sBase64);
-    //    EnsureDiskSpace(oFileData.Length);
-
-    //    var oFileId = Guid.NewGuid();
-    //    var sTempPath = GetTempPath(oFileId);
-    //    var sFinalPath = GetFilePath(oFileId);
-
-    //    int iBufferSize = GetOptimaizBufferSize(oFileData.Length);
-
-    //    IncrementRef(oFileId);
-    //    try
-    //    {
-    //        ExecuteWithRetry(() =>
-    //        {
-    //            using (var oFs = new FileStream(
-    //                sTempPath,
-    //                FileMode.CreateNew,
-    //                FileAccess.Write,
-    //                FileShare.None,
-    //                iBufferSize,
-    //                FileOptions.SequentialScan))
-    //            {
-    //                oFs.Write(oFileData, 0, oFileData.Length);
-    //            }
-    //            File.Move(sTempPath, sFinalPath);
-    //        });
-    //    }
-    //    catch
-    //    {
-    //        SafeDeleteFile(sTempPath);
-    //        DecrementRef(oFileId);
-    //        throw;
-    //    }
-    //    return oFileId;
-    //}
-
-    public Guid SaveFile(Stream oFileStream)
-    {
-        CheckDisposed();
-        if (oFileStream == null)
-            throw new ArgumentNullException(nameof(oFileStream));
-
-        long lFileSize = 0;
-        if (oFileStream.CanSeek)
-        {
-            lFileSize = oFileStream.Length;
-            EnsureDiskSpace(lFileSize);
-        }
-        else
-        {
-            EnsureDiskSpace(_MaxFileSize);
-        }
-
-        var oFileId = Guid.NewGuid();
-        var sTempPath = GetTempPath(oFileId);
-        var sFinalPath = GetFilePath(oFileId);
-
-        int iBufferSize = oFileStream.CanSeek ? GetOptimaizBufferSize(lFileSize) : _DefaultBufferSize;
-
-        IncrementRef(oFileId);
-        try
-        {
-            ExecuteWithRetry(() =>
-            {
-                using (var oFs = new FileStream(
-                    sTempPath,
-                    FileMode.CreateNew,
-                    FileAccess.Write,
-                    FileShare.None,
-                    iBufferSize,
-                    FileOptions.SequentialScan))
-                {
-                    oFileStream.CopyTo(oFs, iBufferSize);
-                }
-                File.Move(sTempPath, sFinalPath);
-            });
-        }
-        catch
-        {
-            SafeDeleteFile(sTempPath);
-            DecrementRef(oFileId);
-            throw;
-        }
-        return oFileId;
-    }
-
-    public async Task<Guid> SaveFileAsync(byte[] oFileData, string sBase64 = null, CancellationToken oCt = default(CancellationToken))
-    {
-        CheckDisposed();
-        if ((oFileData == null || oFileData.Length == 0) && string.IsNullOrEmpty(sBase64))
-            throw new ArgumentException("File data is empty");
-
-        oFileData = oFileData ?? Convert.FromBase64String(sBase64);
-        EnsureDiskSpace(oFileData.Length);
-
-        var oFileId = Guid.NewGuid();
-        var sTempPath = GetTempPath(oFileId);
-        var sFinalPath = GetFilePath(oFileId);
-
-        int iBufferSize = GetOptimaizBufferSize(oFileData.Length);
-
-        IncrementRef(oFileId);
-        try
-        {
-            await ExecuteWithRetryAsync(async () =>
-            {
-                using (var oFs = new FileStream(
-                    sTempPath,
-                    FileMode.CreateNew,
-                    FileAccess.Write,
-                    FileShare.None,
-                    iBufferSize,
-                    FileOptions.Asynchronous | FileOptions.SequentialScan))
-                {
-                    await oFs.WriteAsync(oFileData, 0, oFileData.Length, oCt).ConfigureAwait(false);
-                    await oFs.FlushAsync(oCt).ConfigureAwait(false);
-                }
-                File.Move(sTempPath, sFinalPath);
-            }, oCt).ConfigureAwait(false);
-        }
-        catch
-        {
-            SafeDeleteFile(sTempPath);
-            DecrementRef(oFileId);
-            throw;
-        }
-        return oFileId;
-    }
-
     public async Task<Guid> SaveFileAsync(Stream oFileStream, CancellationToken oCt = default(CancellationToken))
     {
-        CheckDisposed();
-        if (oFileStream == null)
-            throw new ArgumentNullException(nameof(oFileStream));
-
-        long lFileSize = 0;
-        if (oFileStream.CanSeek)
-        {
-            lFileSize = oFileStream.Length;
-            EnsureDiskSpace(lFileSize);
-        }
-        else
-        {
-            EnsureDiskSpace(_MaxFileSize);
-        }
-
-        var oFileId = Guid.NewGuid();
-        var sTempPath = GetTempPath(oFileId);
-        var sFinalPath = GetFilePath(oFileId);
-
-        int iBufferSize = oFileStream.CanSeek ? GetOptimaizBufferSize(lFileSize) : _DefaultBufferSize;
-
-        IncrementRef(oFileId);
-        try
-        {
-            await ExecuteWithRetryAsync(async () =>
-            {
-                using (var oFs = new FileStream(
-                    sTempPath,
-                    FileMode.CreateNew,
-                    FileAccess.Write,
-                    FileShare.None,
-                    iBufferSize,
-                    FileOptions.Asynchronous | FileOptions.SequentialScan))
-                {
-                    await oFileStream.CopyToAsync(oFs, iBufferSize, oCt).ConfigureAwait(false);
-                    await oFs.FlushAsync(oCt).ConfigureAwait(false);
-                }
-                File.Move(sTempPath, sFinalPath);
-            }, oCt).ConfigureAwait(false);
-        }
-        catch
-        {
-            SafeDeleteFile(sTempPath);
-            DecrementRef(oFileId);
-            throw;
-        }
-        return oFileId;
+        return await SaveFileCoreAsync(oFileStream, null, oCt).ConfigureAwait(false);
     }
-
+    public async Task<Guid> SaveFileAsync(byte[] oFileData, CancellationToken oCt = default(CancellationToken))
+    {
+        CheckDisposed();
+        if (oFileData == null || oFileData.Length == 0)
+            throw new ArgumentException("File data is empty");
+        using (var oStream = new MemoryStream(oFileData))
+        {
+            return await SaveFileCoreAsync(oStream, oFileData.Length, oCt).ConfigureAwait(false);
+        }
+    }
+    public async Task<Guid> SaveFileAsync(string sBase64, CancellationToken oCt = default(CancellationToken))
+    {
+        CheckDisposed();
+        if (string.IsNullOrEmpty(sBase64))
+            throw new ArgumentException("File data is empty");
+        var oFileData = Convert.FromBase64String(sBase64);
+        return await SaveFileAsync(oFileData, oCt).ConfigureAwait(false);
+    }
     public Stream GetFile(Guid oFileId)
     {
         CheckDisposed();
@@ -388,7 +216,99 @@ public sealed class FileStorage : IDisposable
             DecrementRef(oFileId);
         }
     }
+    private int GetOptimaizBufferSize(long lFileSize)
+    {
+        if (lFileSize <= 8192) return 8192;
+        if (lFileSize <= 65536) return 16384;
+        if (lFileSize <= 524288) return 32768;
+        return 65536;
+    }
+    private Guid SaveFileCore(Stream oStream, long? lKnownLength = null)
+    {
+        CheckDisposed();
+        if (oStream == null)
+            throw new ArgumentNullException(nameof(oStream));
+        long lFileSize = lKnownLength ?? (oStream.CanSeek ? oStream.Length : _MaxFileSize);
+        if (!lKnownLength.HasValue && oStream.CanSeek)
+            EnsureDiskSpace(oStream.Length);
+        else
+            EnsureDiskSpace(lFileSize);
+        var oFileId = Guid.NewGuid();
+        var sTempPath = GetTempPath(oFileId);
+        var sFinalPath = GetFilePath(oFileId);
+        int iBufferSize = oStream.CanSeek && lKnownLength.HasValue ? GetOptimaizBufferSize(lKnownLength.Value) : _DefaultBufferSize;
+        IncrementRef(oFileId);
+        try
+        {
+            ExecuteWithRetry(() =>
+            {
+                using (var oFs = new FileStream(
+                    sTempPath,
+                    FileMode.CreateNew,
+                    FileAccess.Write,
+                    FileShare.None,
+                    iBufferSize,
+                    FileOptions.SequentialScan))
+                {
+                    oStream.CopyTo(oFs, iBufferSize);
+                }
+                File.Move(sTempPath, sFinalPath);
+            });
+        }
+        catch
+        {
+            SafeDeleteFile(sTempPath);
+            DecrementRef(oFileId);
+            throw;
+        }
 
+        return oFileId;
+    }
+    private async Task<Guid> SaveFileCoreAsync(Stream oStream, long? lKnownLength, CancellationToken oCt = default(CancellationToken))
+    {
+        CheckDisposed();
+        if (oStream == null)
+            throw new ArgumentNullException(nameof(oStream));
+        long lFileSize = lKnownLength ?? (oStream.CanSeek ? oStream.Length : _MaxFileSize);
+        if (!lKnownLength.HasValue && oStream.CanSeek)
+            EnsureDiskSpace(oStream.Length);
+        else
+            EnsureDiskSpace(lFileSize);
+        var oFileId = Guid.NewGuid();
+        var sTempPath = GetTempPath(oFileId);
+        var sFinalPath = GetFilePath(oFileId);
+
+        int iBufferSize = oStream.CanSeek && lKnownLength.HasValue
+            ? GetOptimaizBufferSize(lKnownLength.Value)
+            : _DefaultBufferSize;
+        IncrementRef(oFileId);
+        try
+        {
+            await ExecuteWithRetryAsync(async () =>
+            {
+                using (var oFs = new FileStream(
+                    sTempPath,
+                    FileMode.CreateNew,
+                    FileAccess.Write,
+                    FileShare.None,
+                    iBufferSize,
+                    FileOptions.Asynchronous | FileOptions.SequentialScan))
+                {
+                    await oStream.CopyToAsync(oFs, iBufferSize, oCt).ConfigureAwait(false);
+                    await oFs.FlushAsync(oCt).ConfigureAwait(false);
+                }
+                File.Move(sTempPath, sFinalPath);
+            }, oCt).ConfigureAwait(false);
+        }
+        catch
+        {
+            SafeDeleteFile(sTempPath);
+            DecrementRef(oFileId);
+            throw;
+        }
+
+        return oFileId;
+    }
     private void OnCleanupTimer(object oState)
     {
         if (Interlocked.CompareExchange(ref _CleanupRunning, 1, 0) != 0)
@@ -560,48 +480,6 @@ public sealed class FileStorage : IDisposable
             Debug.WriteLine($"Access denied deleting file: {ex.Message}");
         }
     }
-        private Guid SaveFileCore(Stream oStream, long? lKnownLength = null)
-    {
-        CheckDisposed();
-        if (oStream == null)
-            throw new ArgumentNullException(nameof(oStream));
-        long lFileSize = lKnownLength ?? (oStream.CanSeek ? oStream.Length : _MaxFileSize);
-        if (!lKnownLength.HasValue && oStream.CanSeek)
-            EnsureDiskSpace(oStream.Length);
-        else
-            EnsureDiskSpace(lFileSize);
-        var oFileId = Guid.NewGuid();
-        var sTempPath = GetTempPath(oFileId);
-        var sFinalPath = GetFilePath(oFileId);
-        int iBufferSize = oStream.CanSeek && lKnownLength.HasValue ? GetOptimaizBufferSize(lKnownLength.Value) : _DefaultBufferSize;
-        IncrementRef(oFileId);
-        try
-        {
-            ExecuteWithRetry(() =>
-            {
-                using (var oFs = new FileStream(
-                    sTempPath,
-                    FileMode.CreateNew,
-                    FileAccess.Write,
-                    FileShare.None,
-                    iBufferSize,
-                    FileOptions.SequentialScan))
-                {
-                    oStream.CopyTo(oFs, iBufferSize);
-                }
-                File.Move(sTempPath, sFinalPath);
-            });
-        }
-        catch
-        {
-            SafeDeleteFile(sTempPath);
-            DecrementRef(oFileId);
-            throw;
-        }
-
-        return oFileId;
-    }
-
 
     private void CheckDisposed()
     {
