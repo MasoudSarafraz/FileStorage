@@ -44,50 +44,27 @@ public sealed class FileStorage : IDisposable
         if (lFileSize <= 524288) return 32768;
         return 65536;
     }
-
+    public Guid SaveFile(Stream oFileStream)
+    {
+        return SaveFileCore(oFileStream);
+    }
     public Guid SaveFile(byte[] oFileData)
     {
         CheckDisposed();
-        if ((oFileData == null || oFileData.Length == 0))
+        if (oFileData == null || oFileData.Length == 0)
             throw new ArgumentException("File data is empty");
-        EnsureDiskSpace(oFileData.Length);
-        var oFileId = Guid.NewGuid();
-        var sTempPath = GetTempPath(oFileId);
-        var sFinalPath = GetFilePath(oFileId);
 
-        int iBufferSize = GetOptimaizBufferSize(oFileData.Length);
-
-        IncrementRef(oFileId);
-        try
+        using (var oStream = new MemoryStream(oFileData))
         {
-            ExecuteWithRetry(() =>
-            {
-                using (var oFs = new FileStream(
-                    sTempPath,
-                    FileMode.CreateNew,
-                    FileAccess.Write,
-                    FileShare.None,
-                    iBufferSize,
-                    FileOptions.SequentialScan))
-                {
-                    oFs.Write(oFileData, 0, oFileData.Length);
-                }
-                File.Move(sTempPath, sFinalPath);
-            });
+            return SaveFileCore(oStream, oFileData.Length);
         }
-        catch
-        {
-            SafeDeleteFile(sTempPath);
-            DecrementRef(oFileId);
-            throw;
-        }
-        return oFileId;
     }
     public Guid SaveFile(string sBase64)
     {
         CheckDisposed();
         if (string.IsNullOrEmpty(sBase64))
             throw new ArgumentException("File data is empty");
+
         var oFileData = Convert.FromBase64String(sBase64);
         return SaveFile(oFileData);
     }
@@ -583,6 +560,48 @@ public sealed class FileStorage : IDisposable
             Debug.WriteLine($"Access denied deleting file: {ex.Message}");
         }
     }
+        private Guid SaveFileCore(Stream oStream, long? lKnownLength = null)
+    {
+        CheckDisposed();
+        if (oStream == null)
+            throw new ArgumentNullException(nameof(oStream));
+        long lFileSize = lKnownLength ?? (oStream.CanSeek ? oStream.Length : _MaxFileSize);
+        if (!lKnownLength.HasValue && oStream.CanSeek)
+            EnsureDiskSpace(oStream.Length);
+        else
+            EnsureDiskSpace(lFileSize);
+        var oFileId = Guid.NewGuid();
+        var sTempPath = GetTempPath(oFileId);
+        var sFinalPath = GetFilePath(oFileId);
+        int iBufferSize = oStream.CanSeek && lKnownLength.HasValue ? GetOptimaizBufferSize(lKnownLength.Value) : _DefaultBufferSize;
+        IncrementRef(oFileId);
+        try
+        {
+            ExecuteWithRetry(() =>
+            {
+                using (var oFs = new FileStream(
+                    sTempPath,
+                    FileMode.CreateNew,
+                    FileAccess.Write,
+                    FileShare.None,
+                    iBufferSize,
+                    FileOptions.SequentialScan))
+                {
+                    oStream.CopyTo(oFs, iBufferSize);
+                }
+                File.Move(sTempPath, sFinalPath);
+            });
+        }
+        catch
+        {
+            SafeDeleteFile(sTempPath);
+            DecrementRef(oFileId);
+            throw;
+        }
+
+        return oFileId;
+    }
+
 
     private void CheckDisposed()
     {
