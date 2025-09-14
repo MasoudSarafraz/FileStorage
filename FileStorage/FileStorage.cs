@@ -1,7 +1,9 @@
 using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Security;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -12,76 +14,46 @@ public sealed class FileStorage : IDisposable
     private readonly ConcurrentDictionary<Guid, int> _ActiveRefs = new ConcurrentDictionary<Guid, int>();
     private readonly Timer _CleanupTimer;
     private readonly ManualResetEventSlim _CleanupCompleted = new ManualResetEventSlim(true);
-    private readonly object _CleanupLock = new object();
-    private readonly object _RefLock = new object();
-    private readonly double _FreeSpaceBufferRatio = 0.1;//جهت در نظر گرفتن 10% فضای بیشتر برای ذخیره فایل
-    private int _CleanupRunning;
-    private int _Disposed;
+    private readonly object _RefsLock = new object();
+    private readonly double _FreeSpaceBufferRatio = 0.1;//در نظر گرفتن ده درصد فضای بیشتر
+    private volatile int _CleanupRunning;
+    private volatile int _Disposed;
     private static readonly ThreadLocal<Random> _Random = new ThreadLocal<Random>(() => new Random(Guid.NewGuid().GetHashCode()));
     private const int _DefaultBufferSize = 8192;
     private const long _MaxFileSize = 100 * 1024 * 1024;
     private readonly DriveInfo _DriveInfo;
+    private long _LastDiskCheckTime;
+    private long _LastFreeSpace;
 
     public FileStorage(string sPath, uint iDeleteEveryHours = 1)
     {
         if (string.IsNullOrWhiteSpace(sPath))
             throw new ArgumentNullException(nameof(sPath));
-
-        _StoragePath = sPath;
+        try
+        {
+            _StoragePath = Path.GetFullPath(sPath);
+            if (!Path.IsPathRooted(_StoragePath))
+                throw new ArgumentException("Path must be rooted", nameof(sPath));
+        }
+        catch (Exception ex) when (ex is ArgumentException || ex is PathTooLongException || ex is NotSupportedException)
+        {
+            throw new ArgumentException("Invalid storage path", nameof(sPath), ex);
+        }
         _DeleteEveryHours = iDeleteEveryHours;
-        Directory.CreateDirectory(sPath);
-        _DriveInfo = new DriveInfo(Path.GetPathRoot(Path.GetFullPath(sPath)));
-
+        Directory.CreateDirectory(_StoragePath);
+        _DriveInfo = new DriveInfo(Path.GetPathRoot(_StoragePath));
         var oDelay = TimeSpan.FromHours(iDeleteEveryHours);
         var iMs = (int)Math.Min((long)oDelay.TotalMilliseconds, int.MaxValue);
         _CleanupTimer = new Timer(OnCleanupTimer, null, iMs, iMs);
     }
-    public Guid SaveFile(Stream oFileStream)
-    {
-        return SaveFileCore(oFileStream);
-    }
-    public Guid SaveFile(byte[] oFileData)
-    {
-        CheckDisposed();
-        if (oFileData == null || oFileData.Length == 0)
-            throw new ArgumentException("File data is empty");
 
-        using (var oStream = new MemoryStream(oFileData))
-        {
-            return SaveFileCore(oStream, oFileData.Length);
-        }
-    }
-    public Guid SaveFile(string sBase64)
-    {
-        CheckDisposed();
-        if (string.IsNullOrEmpty(sBase64))
-            throw new ArgumentException("File data is empty");
+    public Guid SaveFile(Stream oFileStream) => SaveFileCore(oFileStream);
+    public Guid SaveFile(byte[] oFileData) => SaveFileCore(new MemoryStream(oFileData), oFileData.Length);
+    public Guid SaveFile(string sBase64) => SaveFile(Convert.FromBase64String(sBase64));
+    public Task<Guid> SaveFileAsync(Stream oFileStream, CancellationToken oCt = default) => SaveFileCoreAsync(oFileStream, null, oCt);
+    public Task<Guid> SaveFileAsync(byte[] oFileData, CancellationToken oCt = default) => SaveFileCoreAsync(new MemoryStream(oFileData), oFileData.Length, oCt);
+    public Task<Guid> SaveFileAsync(string sBase64, CancellationToken oCt = default) => SaveFileAsync(Convert.FromBase64String(sBase64), oCt);
 
-        var oFileData = Convert.FromBase64String(sBase64);
-        return SaveFile(oFileData);
-    }
-    public async Task<Guid> SaveFileAsync(Stream oFileStream, CancellationToken oCt = default(CancellationToken))
-    {
-        return await SaveFileCoreAsync(oFileStream, null, oCt).ConfigureAwait(false);
-    }
-    public async Task<Guid> SaveFileAsync(byte[] oFileData, CancellationToken oCt = default(CancellationToken))
-    {
-        CheckDisposed();
-        if (oFileData == null || oFileData.Length == 0)
-            throw new ArgumentException("File data is empty");
-        using (var oStream = new MemoryStream(oFileData))
-        {
-            return await SaveFileCoreAsync(oStream, oFileData.Length, oCt).ConfigureAwait(false);
-        }
-    }
-    public async Task<Guid> SaveFileAsync(string sBase64, CancellationToken oCt = default(CancellationToken))
-    {
-        CheckDisposed();
-        if (string.IsNullOrEmpty(sBase64))
-            throw new ArgumentException("File data is empty");
-        var oFileData = Convert.FromBase64String(sBase64);
-        return await SaveFileAsync(oFileData, oCt).ConfigureAwait(false);
-    }
     public Stream GetFile(Guid oFileId)
     {
         CheckDisposed();
@@ -102,15 +74,13 @@ public sealed class FileStorage : IDisposable
         }
     }
 
-    public async Task<Stream> GetFileAsync(Guid oFileId, CancellationToken oCt = default(CancellationToken))
+    public async Task<Stream> GetFileAsync(Guid oFileId, CancellationToken oCt = default)
     {
         CheckDisposed();
         oCt.ThrowIfCancellationRequested();
         var sFilePath = GetFilePath(oFileId);
-
         if (!File.Exists(sFilePath))
             throw new FileNotFoundException("File not found.", sFilePath);
-
         try
         {
             return new FileStream(
@@ -131,10 +101,8 @@ public sealed class FileStorage : IDisposable
     {
         CheckDisposed();
         var sFilePath = GetFilePath(oFileId);
-
         if (!File.Exists(sFilePath))
             throw new FileNotFoundException("File not found.", sFilePath);
-
         var iFileSize = new FileInfo(sFilePath).Length;
         if (iFileSize > _MaxFileSize)
             throw new IOException($"File is too large to load into memory (max {_MaxFileSize} bytes).");
@@ -172,14 +140,12 @@ public sealed class FileStorage : IDisposable
         }
     }
 
-    public async Task<byte[]> GetFileBytesAsync(Guid oFileId, CancellationToken oCt = default(CancellationToken))
+    public async Task<byte[]> GetFileBytesAsync(Guid oFileId, CancellationToken oCt = default)
     {
         CheckDisposed();
         var sFilePath = GetFilePath(oFileId);
-
         if (!File.Exists(sFilePath))
             throw new FileNotFoundException("File not found.", sFilePath);
-
         var iFileSize = new FileInfo(sFilePath).Length;
         if (iFileSize > _MaxFileSize)
             throw new IOException($"File is too large to load into memory (max {_MaxFileSize} bytes).");
@@ -216,6 +182,7 @@ public sealed class FileStorage : IDisposable
             DecrementRef(oFileId);
         }
     }
+
     private int GetOptimaizBufferSize(long lFileSize)
     {
         if (lFileSize <= 8192) return 8192;
@@ -223,20 +190,20 @@ public sealed class FileStorage : IDisposable
         if (lFileSize <= 524288) return 32768;
         return 65536;
     }
+
     private Guid SaveFileCore(Stream oStream, long? lKnownLength = null)
     {
         CheckDisposed();
         if (oStream == null)
             throw new ArgumentNullException(nameof(oStream));
         long lFileSize = lKnownLength ?? (oStream.CanSeek ? oStream.Length : _MaxFileSize);
-        if (!lKnownLength.HasValue && oStream.CanSeek)
-            EnsureDiskSpace(oStream.Length);
-        else
-            EnsureDiskSpace(lFileSize);
+        EnsureDiskSpace(lFileSize);
+
         var oFileId = Guid.NewGuid();
         var sTempPath = GetTempPath(oFileId);
         var sFinalPath = GetFilePath(oFileId);
         int iBufferSize = oStream.CanSeek && lKnownLength.HasValue ? GetOptimaizBufferSize(lKnownLength.Value) : _DefaultBufferSize;
+
         IncrementRef(oFileId);
         try
         {
@@ -261,26 +228,24 @@ public sealed class FileStorage : IDisposable
             DecrementRef(oFileId);
             throw;
         }
-
         return oFileId;
     }
-    private async Task<Guid> SaveFileCoreAsync(Stream oStream, long? lKnownLength, CancellationToken oCt = default(CancellationToken))
+
+    private async Task<Guid> SaveFileCoreAsync(Stream oStream, long? lKnownLength, CancellationToken oCt = default)
     {
         CheckDisposed();
         if (oStream == null)
             throw new ArgumentNullException(nameof(oStream));
         long lFileSize = lKnownLength ?? (oStream.CanSeek ? oStream.Length : _MaxFileSize);
-        if (!lKnownLength.HasValue && oStream.CanSeek)
-            EnsureDiskSpace(oStream.Length);
-        else
-            EnsureDiskSpace(lFileSize);
+        EnsureDiskSpace(lFileSize);
+
         var oFileId = Guid.NewGuid();
         var sTempPath = GetTempPath(oFileId);
         var sFinalPath = GetFilePath(oFileId);
-
         int iBufferSize = oStream.CanSeek && lKnownLength.HasValue
             ? GetOptimaizBufferSize(lKnownLength.Value)
             : _DefaultBufferSize;
+
         IncrementRef(oFileId);
         try
         {
@@ -295,7 +260,6 @@ public sealed class FileStorage : IDisposable
                     FileOptions.Asynchronous | FileOptions.SequentialScan))
                 {
                     await oStream.CopyToAsync(oFs, iBufferSize, oCt).ConfigureAwait(false);
-                    await oFs.FlushAsync(oCt).ConfigureAwait(false);
                 }
                 File.Move(sTempPath, sFinalPath);
             }, oCt).ConfigureAwait(false);
@@ -306,11 +270,14 @@ public sealed class FileStorage : IDisposable
             DecrementRef(oFileId);
             throw;
         }
-
         return oFileId;
     }
+
     private void OnCleanupTimer(object oState)
     {
+        if (_Disposed != 0)
+            return;
+
         if (Interlocked.CompareExchange(ref _CleanupRunning, 1, 0) != 0)
             return;
 
@@ -321,7 +288,7 @@ public sealed class FileStorage : IDisposable
         }
         catch (Exception ex)
         {
-            Debug.WriteLine($"Cleanup failed: {ex.Message}");
+            //Debug.WriteLine($"Cleanup failed: {ex}");
         }
         finally
         {
@@ -332,50 +299,55 @@ public sealed class FileStorage : IDisposable
 
     private void CleanupOldFiles()
     {
-        lock (_CleanupLock)
+        var oCutoff = DateTime.UtcNow - TimeSpan.FromHours(_DeleteEveryHours);
+        var oFilesToDelete = new List<string>();
+        var oTempFilesToDelete = new List<string>();
+
+        try
         {
-            var oCutoff = DateTime.UtcNow - TimeSpan.FromHours(_DeleteEveryHours);
-            try
+            var oDirInfo = new DirectoryInfo(_StoragePath);
+
+            foreach (var oFileInfo in oDirInfo.EnumerateFiles("*.dat"))
             {
-                var oDirInfo = new DirectoryInfo(_StoragePath);
-                foreach (var oFileInfo in oDirInfo.EnumerateFiles("*.dat"))
+                try
                 {
-                    try
+                    var sFileName = Path.GetFileNameWithoutExtension(oFileInfo.Name);
+                    if (!Guid.TryParseExact(sFileName, "N", out var oFileId))
+                        continue;
+
+                    bool bHasActiveRef;
+                    lock (_RefsLock)
                     {
-                        var sFileName = Path.GetFileNameWithoutExtension(oFileInfo.Name);
-                        if (!Guid.TryParseExact(sFileName, "N", out var oFileId))
-                            continue;
-
-                        if (_ActiveRefs.TryGetValue(oFileId, out int iCount) && iCount > 0)
-                            continue;
-
-                        if (oFileInfo.CreationTimeUtc < oCutoff)
-                        {
-                            SafeDeleteFile(oFileInfo.FullName);
-                        }
+                        bHasActiveRef = _ActiveRefs.TryGetValue(oFileId, out int iCount) && iCount > 0;
                     }
-                    catch (Exception ex)
+
+                    if (!bHasActiveRef && oFileInfo.CreationTimeUtc < oCutoff)
                     {
-                        Debug.WriteLine($"Error during file cleanup: {ex.Message}");
+                        oFilesToDelete.Add(oFileInfo.FullName);
                     }
                 }
-
-                foreach (var oFileInfo in oDirInfo.EnumerateFiles("*.tmp"))
+                catch (Exception ex)
                 {
-                    try
-                    {
-                        SafeDeleteFile(oFileInfo.FullName);
-                    }
-                    catch (Exception ex)
-                    {
-                        Debug.WriteLine($"Error during temp file cleanup: {ex.Message}");
-                    }
+                    //Debug.WriteLine($"Error during file cleanup: {ex}");
                 }
             }
-            catch (Exception ex)
+
+            foreach (var oFileInfo in oDirInfo.EnumerateFiles("*.tmp"))
             {
-                Debug.WriteLine($"Global cleanup error: {ex.Message}");
+                oTempFilesToDelete.Add(oFileInfo.FullName);
             }
+            foreach (var sFilePath in oFilesToDelete)
+            {
+                SafeDeleteFile(sFilePath);
+            }
+            foreach (var sFilePath in oTempFilesToDelete)
+            {
+                SafeDeleteFile(sFilePath);
+            }
+        }
+        catch (Exception ex)
+        {
+            //Debug.WriteLine($"Global cleanup error: {ex}");
         }
     }
 
@@ -384,7 +356,7 @@ public sealed class FileStorage : IDisposable
 
     private void IncrementRef(Guid oFileId)
     {
-        lock (_RefLock)
+        lock (_RefsLock)
         {
             _ActiveRefs.AddOrUpdate(oFileId, 1, (key, value) => value + 1);
         }
@@ -392,17 +364,17 @@ public sealed class FileStorage : IDisposable
 
     private void DecrementRef(Guid oFileId)
     {
-        lock (_RefLock)
+        lock (_RefsLock)
         {
-            int newCount = _ActiveRefs.AddOrUpdate(oFileId, 0, (key, value) => value > 0 ? value - 1 : 0);
-            if (newCount == 0)
+            int iNewValue = _ActiveRefs.AddOrUpdate(oFileId, 0, (key, value) => value - 1);
+            if (iNewValue <= 0)
             {
                 _ActiveRefs.TryRemove(oFileId, out _);
             }
         }
     }
 
-    private T ExecuteWithRetry<T>(Func<T> oFunc, int iMaxRetries = 5, int iBaseDelay = 20)
+    private T ExecuteWithRetry<T>(Func<T> oFunc, int iMaxRetries = 2, int iBaseDelay = 5)
     {
         for (int i = 0; i < iMaxRetries; i++)
         {
@@ -410,15 +382,15 @@ public sealed class FileStorage : IDisposable
             {
                 return oFunc();
             }
-            catch (IOException) when (i < iMaxRetries - 1)
+            catch (Exception ex) when (IsTransientFileError(ex) && i < iMaxRetries - 1)
             {
-                Thread.Sleep(iBaseDelay * (1 << i) + _Random.Value.Next(5, 50));
+                Thread.Sleep(iBaseDelay * (1 << i) + _Random.Value.Next(0, 5));
             }
         }
         throw new IOException("File operation failed after retries");
     }
 
-    private void ExecuteWithRetry(Action oAction, int iMaxRetries = 5, int iBaseDelay = 20)
+    private void ExecuteWithRetry(Action oAction, int iMaxRetries = 2, int iBaseDelay = 5)
     {
         ExecuteWithRetry(() =>
         {
@@ -427,7 +399,7 @@ public sealed class FileStorage : IDisposable
         }, iMaxRetries, iBaseDelay);
     }
 
-    private async Task<T> ExecuteWithRetryAsync<T>(Func<Task<T>> oFunc, CancellationToken oCt = default(CancellationToken), int iMaxRetries = 5, int iBaseDelay = 20)
+    private async Task<T> ExecuteWithRetryAsync<T>(Func<Task<T>> oFunc, CancellationToken oCt = default, int iMaxRetries = 2, int iBaseDelay = 5)
     {
         for (int i = 0; i < iMaxRetries; i++)
         {
@@ -436,16 +408,16 @@ public sealed class FileStorage : IDisposable
             {
                 return await oFunc().ConfigureAwait(false);
             }
-            catch (IOException) when (i < iMaxRetries - 1)
+            catch (Exception ex) when (IsTransientFileError(ex) && i < iMaxRetries - 1)
             {
-                var iDelay = iBaseDelay * (1 << i) + _Random.Value.Next(5, 50);
+                var iDelay = iBaseDelay * (1 << i) + _Random.Value.Next(0, 5);
                 await Task.Delay(iDelay, oCt).ConfigureAwait(false);
             }
         }
         throw new IOException("Async file operation failed after retries");
     }
 
-    private async Task ExecuteWithRetryAsync(Func<Task> oAction, CancellationToken oCt = default(CancellationToken), int iMaxRetries = 5, int iBaseDelay = 20)
+    private async Task ExecuteWithRetryAsync(Func<Task> oAction, CancellationToken oCt = default, int iMaxRetries = 2, int iBaseDelay = 5)
     {
         await ExecuteWithRetryAsync(async () =>
         {
@@ -456,35 +428,54 @@ public sealed class FileStorage : IDisposable
 
     private void EnsureDiskSpace(long lRequiredSpace)
     {
-        long lRequiredWithBuffer = (long)(lRequiredSpace * (1 + _FreeSpaceBufferRatio));
-        if (_DriveInfo.AvailableFreeSpace < lRequiredWithBuffer)
-            throw new IOException("Not enough disk space available.");
+        long lNow = Stopwatch.GetTimestamp();
+        if (lNow - _LastDiskCheckTime < TimeSpan.TicksPerSecond * 5)
+        {
+            if (_LastFreeSpace >= lRequiredSpace * (1 + _FreeSpaceBufferRatio))
+                return;
+        }
+
+        lock (_RefsLock)
+        {
+            lNow = Stopwatch.GetTimestamp();
+            if (lNow - _LastDiskCheckTime >= TimeSpan.TicksPerSecond * 5)
+            {
+                _LastFreeSpace = _DriveInfo.AvailableFreeSpace;
+                _LastDiskCheckTime = lNow;
+            }
+
+            long lRequiredWithBuffer = (long)(lRequiredSpace * (1 + _FreeSpaceBufferRatio));
+            if (_LastFreeSpace < lRequiredWithBuffer)
+                throw new IOException("Not enough disk space available.");
+        }
     }
 
     private void SafeDeleteFile(string sPath)
     {
         try
         {
-            File.Delete(sPath);
+            if (File.Exists(sPath))
+                File.Delete(sPath);
         }
-        catch (FileNotFoundException)
+        catch (Exception ex) when (ex is FileNotFoundException || ex is DirectoryNotFoundException)
         {
-            // No Matter
+            // File doesn't exist, ignore
         }
-        catch (IOException ex)
+        catch (Exception ex)
         {
-            Debug.WriteLine($"Error deleting file: {ex.Message}");
-        }
-        catch (UnauthorizedAccessException ex)
-        {
-            Debug.WriteLine($"Access denied deleting file: {ex.Message}");
+            //Debug.WriteLine($"Error deleting file '{sPath}': {ex}");
         }
     }
 
     private void CheckDisposed()
     {
-        if (Interlocked.CompareExchange(ref _Disposed, 0, 0) == 1)
-            throw new ObjectDisposedException("FileStorage2");
+        if (_Disposed != 0)
+            throw new ObjectDisposedException("FileStorage");
+    }
+
+    private bool IsTransientFileError(Exception oEx)
+    {
+        return oEx is IOException || oEx is UnauthorizedAccessException || oEx is SecurityException;
     }
 
     public void Dispose()
@@ -492,10 +483,32 @@ public sealed class FileStorage : IDisposable
         if (Interlocked.CompareExchange(ref _Disposed, 1, 0) != 0)
             return;
 
-        _CleanupTimer?.Change(Timeout.Infinite, Timeout.Infinite);
-        _CleanupCompleted.Wait();
-        _CleanupTimer?.Dispose();
-        _ActiveRefs.Clear();
-        _CleanupCompleted.Dispose();
+        try
+        {
+            _CleanupTimer?.Change(Timeout.Infinite, Timeout.Infinite);
+
+            if (_CleanupRunning != 0)
+            {
+                _CleanupCompleted.Wait(TimeSpan.FromSeconds(5));
+            }
+        }
+        catch (Exception ex)
+        {
+            //Debug.WriteLine($"Error during timer disposal: {ex}");
+        }
+        finally
+        {
+            try
+            {
+                _CleanupTimer?.Dispose();
+            }
+            catch (Exception ex)
+            {
+                //Debug.WriteLine($"Error disposing timer: {ex}");
+            }
+
+            _ActiveRefs.Clear();
+            _CleanupCompleted.Dispose();
+        }
     }
 }
