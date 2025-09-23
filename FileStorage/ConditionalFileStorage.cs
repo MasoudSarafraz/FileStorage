@@ -57,7 +57,7 @@ public sealed class ConditionalFileStorage : IDisposable
         _DeleteEveryHours = iDeleteEveryHours;
         Directory.CreateDirectory(_StoragePath);
         _DriveInfo = new DriveInfo(Path.GetPathRoot(_StoragePath));
-        _LogFilePath = Path.Combine(_StoragePath, "FileStorageErrors.log");
+        _LogFilePath = Path.Combine(_StoragePath, "FileStorageLogs.log");
         // بررسی مجوزهای دسترسی
         CheckPermissions();
 
