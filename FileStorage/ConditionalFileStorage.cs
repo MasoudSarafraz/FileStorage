@@ -559,11 +559,11 @@ public sealed class ConditionalFileStorage : IDisposable
         return oEx is IOException || oEx is UnauthorizedAccessException || oEx is SecurityException;
     }
 
-    private void LogMessage(string message)
+    private void LogMessage(string sMessage)
     {
         try
         {
-            string logEntry = $"{DateTime.Now:yyyy-MM-dd HH:mm:ss}: {message}{Environment.NewLine}";
+            string logEntry = $"{DateTime.Now:yyyy-MM-dd HH:mm:ss}: {sMessage}{Environment.NewLine}";
             File.AppendAllText(_LogFilePath, logEntry);
         }
         catch { }
