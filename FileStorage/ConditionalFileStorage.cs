@@ -14,7 +14,6 @@ using System.Threading.Tasks;
 #if WEB
 using System.Web.Hosting;
 #endif
-
 public sealed class ConditionalFileStorage : IDisposable
 #if WEB
     , IRegisteredObject
@@ -38,7 +37,7 @@ public sealed class ConditionalFileStorage : IDisposable
     private readonly string _LogFilePath;
 
 #if WEB
-    private object _RegisteredObject;
+    private FileStorageRegisteredObject _RegisteredObject;
 #endif
 
     public ConditionalFileStorage(string sPath, uint iDeleteEveryHours = 1)
@@ -55,7 +54,6 @@ public sealed class ConditionalFileStorage : IDisposable
         {
             throw new ArgumentException("Invalid storage path", nameof(sPath), ex);
         }
-
         _DeleteEveryHours = iDeleteEveryHours;
         Directory.CreateDirectory(_StoragePath);
         _DriveInfo = new DriveInfo(Path.GetPathRoot(_StoragePath));
@@ -91,9 +89,7 @@ public sealed class ConditionalFileStorage : IDisposable
         catch (Exception ex)
         {
             string currentUser = WindowsIdentity.GetCurrent().Name;
-            throw new Exception(
-                $"The application does not have write/delete permissions on the storage path: {_StoragePath}. " +
-                $"Current user: {currentUser}. " +
+            throw new Exception($"The application does not have write/delete permissions on the storage path: {_StoragePath}. " + $"Current user: {currentUser}. " +
                 $"Please grant 'Modify' permissions to the Application Pool identity. Error: {ex.Message}", ex);
         }
     }
@@ -251,6 +247,7 @@ public sealed class ConditionalFileStorage : IDisposable
         var sTempPath = GetTempPath(oFileId);
         var sFinalPath = GetFilePath(oFileId);
         int iBufferSize = oStream.CanSeek && lKnownLength.HasValue ? GetOptimizedBufferSize(lKnownLength.Value) : _DefaultBufferSize;
+
         IncrementRef(oFileId);
         try
         {
@@ -288,10 +285,7 @@ public sealed class ConditionalFileStorage : IDisposable
         var oFileId = Guid.NewGuid();
         var sTempPath = GetTempPath(oFileId);
         var sFinalPath = GetFilePath(oFileId);
-        int iBufferSize = oStream.CanSeek && lKnownLength.HasValue
-            ? GetOptimizedBufferSize(lKnownLength.Value)
-            : _DefaultBufferSize;
-
+        int iBufferSize = oStream.CanSeek && lKnownLength.HasValue ? GetOptimizedBufferSize(lKnownLength.Value) : _DefaultBufferSize;
         IncrementRef(oFileId);
         try
         {
@@ -408,7 +402,6 @@ public sealed class ConditionalFileStorage : IDisposable
                 else
                     iFailedCount++;
             }
-
             LogError($"Cleanup completed. Deleted: {iDeletedCount}, Failed: {iFailedCount}");
         }
         catch (Exception ex)
@@ -500,7 +493,6 @@ public sealed class ConditionalFileStorage : IDisposable
             if (_LastFreeSpace >= lRequiredSpace * (1 + _FreeSpaceBufferRatio))
                 return;
         }
-
         lock (_RefsLock)
         {
             lNow = Stopwatch.GetTimestamp();
@@ -509,7 +501,6 @@ public sealed class ConditionalFileStorage : IDisposable
                 _LastFreeSpace = _DriveInfo.AvailableFreeSpace;
                 _LastDiskCheckTime = lNow;
             }
-
             long lRequiredWithBuffer = (long)(lRequiredSpace * (1 + _FreeSpaceBufferRatio));
             if (_LastFreeSpace < lRequiredWithBuffer)
                 throw new IOException("Not enough disk space available.");
@@ -518,21 +509,22 @@ public sealed class ConditionalFileStorage : IDisposable
 
     private bool SafeDeleteFile(string sPath)
     {
-        const int maxRetries = 3;
-        const int baseDelayMs = 100;
-
-        for (int i = 0; i < maxRetries; i++)
+        const int iMaxRetries = 3;
+        const int iBaseDelayMs = 100;
+        for (int i = 0; i < iMaxRetries; i++)
         {
             try
             {
                 if (!File.Exists(sPath))
                     return true;
+                // بررسی ویژگی فقط-خواندنی
                 var fileInfo = new FileInfo(sPath);
                 if (fileInfo.IsReadOnly)
                 {
                     fileInfo.IsReadOnly = false;
                     LogError($"Removed read-only attribute from file: {sPath}");
                 }
+                // تلاش برای حذف فایل
                 File.Delete(sPath);
                 LogError($"Successfully deleted file: {sPath}");
                 return true;
@@ -541,10 +533,10 @@ public sealed class ConditionalFileStorage : IDisposable
             {
                 return true; // فایل وجود ندارد - موفقیت‌آمیز در نظر گرفته می‌شود
             }
-            catch (Exception ex) when (i < maxRetries - 1 && (ex is IOException || ex is UnauthorizedAccessException))
+            catch (Exception ex) when (i < iMaxRetries - 1 && (ex is IOException || ex is UnauthorizedAccessException))
             {
-                LogError($"Attempt {i + 1} to delete file '{sPath}' failed: {ex.Message}. Retrying in {baseDelayMs * (i + 1)}ms...");
-                Thread.Sleep(baseDelayMs * (i + 1));
+                LogError($"Attempt {i + 1} to delete file '{sPath}' failed: {ex.Message}. Retrying in {iBaseDelayMs * (i + 1)}ms...");
+                Thread.Sleep(iBaseDelayMs * (i + 1));
             }
             catch (Exception ex)
             {
@@ -553,14 +545,13 @@ public sealed class ConditionalFileStorage : IDisposable
             }
         }
 
-        LogError($"Failed to delete file '{sPath}' after {maxRetries} attempts.");
+        LogError($"Failed to delete file '{sPath}' after {iMaxRetries} attempts.");
         return false;
     }
 
     private void CheckDisposed()
     {
-        if (_Disposed != 0)
-            throw new ObjectDisposedException("FileStorage");
+        if (_Disposed != 0) throw new ObjectDisposedException("FileStorage");
     }
 
     private bool IsTransientFileError(Exception oEx)
@@ -617,6 +608,7 @@ public sealed class ConditionalFileStorage : IDisposable
             {
                 LogError($"Error disposing timer: {ex}");
             }
+
             _ActiveRefs.Clear();
             _CleanupCompleted.Dispose();
         }
@@ -652,11 +644,11 @@ public sealed class ConditionalFileStorage : IDisposable
 
     private class FileStorageRegisteredObject : IRegisteredObject
     {
-        private readonly FileStorage _Storage;
+        private readonly ConditionalFileStorage _Storage;
 
-        public FileStorageRegisteredObject(FileStorage oStorage)
+        public FileStorageRegisteredObject(ConditionalFileStorage storage)
         {
-            _Storage = oStorage;
+            _Storage = storage;
         }
 
         public void Stop(bool blnImmediate)
