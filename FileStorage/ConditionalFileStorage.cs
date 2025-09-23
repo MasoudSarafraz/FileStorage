@@ -1,4 +1,7 @@
-﻿using System;
+﻿// برای استفاده در محیط‌های وب و ویندوزی
+// در پروژه‌های وب، باید نماد کامپایل شرطی "WEB" را تعریف کنید
+// در پروژه‌های ویندوزی، نیازی به تعریف این نماد نیست
+using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -7,9 +10,15 @@ using System.Security;
 using System.Security.Principal;
 using System.Threading;
 using System.Threading.Tasks;
-using System.Web.Hosting;
 
-public sealed class WebFileStorage : IDisposable, IRegisteredObject
+#if WEB
+using System.Web.Hosting;
+#endif
+
+public sealed class ConditionalFileStorage : IDisposable
+#if WEB
+    , IRegisteredObject
+#endif
 {
     private readonly string _StoragePath;
     private readonly uint _DeleteEveryHours;
@@ -17,7 +26,7 @@ public sealed class WebFileStorage : IDisposable, IRegisteredObject
     private Timer _CleanupTimer;
     private readonly ManualResetEventSlim _CleanupCompleted = new ManualResetEventSlim(true);
     private readonly object _RefsLock = new object();
-    private readonly double _FreeSpaceBufferRatio = 0.1;//در نظر گرفتن ده درصد فضای بیشتر
+    private readonly double _FreeSpaceBufferRatio = 0.1;
     private volatile int _CleanupRunning;
     private volatile int _Disposed;
     private static readonly ThreadLocal<Random> _Random = new ThreadLocal<Random>(() => new Random(Guid.NewGuid().GetHashCode()));
@@ -28,7 +37,11 @@ public sealed class WebFileStorage : IDisposable, IRegisteredObject
     private long _LastFreeSpace;
     private readonly string _LogFilePath;
 
-    public WebFileStorage(string sPath, uint iDeleteEveryHours = 1)
+#if WEB
+    private object _RegisteredObject;
+#endif
+
+    public ConditionalFileStorage(string sPath, uint iDeleteEveryHours = 1)
     {
         if (string.IsNullOrWhiteSpace(sPath))
             throw new ArgumentNullException(nameof(sPath));
@@ -42,16 +55,27 @@ public sealed class WebFileStorage : IDisposable, IRegisteredObject
         {
             throw new ArgumentException("Invalid storage path", nameof(sPath), ex);
         }
+
         _DeleteEveryHours = iDeleteEveryHours;
         Directory.CreateDirectory(_StoragePath);
         _DriveInfo = new DriveInfo(Path.GetPathRoot(_StoragePath));
         _LogFilePath = Path.Combine(_StoragePath, "FileStorageErrors.log");
+        // بررسی مجوزهای دسترسی
         CheckPermissions();
-        HostingEnvironment.RegisterObject(this);
+
+#if WEB
+        // ثبت در هاستینگ محیط برای جلوگیری از خاموش شدن تایمر
+        if (HostingEnvironment.IsHosted)
+        {
+            _RegisteredObject = new FileStorageRegisteredObject(this);
+            HostingEnvironment.RegisterObject(_RegisteredObject);
+        }
+#endif
+        // ایجاد تایمر با اجرای اولیه بلافاصله
         var oDelay = TimeSpan.FromHours(iDeleteEveryHours);
         int iMs = (int)Math.Min((long)oDelay.TotalMilliseconds, int.MaxValue);
         _CleanupTimer = new Timer(OnCleanupTimer, null, 30000, iMs); // 30 ثانیه = 30000 میلی‌ثانیه
-        LogMessage($"FileStorage initialized. Path: {_StoragePath}, Cleanup interval: {iDeleteEveryHours} hours");
+        LogError($"FileStorage initialized. Path: {_StoragePath}, Cleanup interval: {iDeleteEveryHours} hours");
     }
 
     private void CheckPermissions()
@@ -60,8 +84,9 @@ public sealed class WebFileStorage : IDisposable, IRegisteredObject
         {
             string testFile = Path.Combine(_StoragePath, "permission_test.tmp");
             File.WriteAllText(testFile, "test");
+            // بررسی امکان حذف فایل
             File.Delete(testFile);
-            LogMessage("Permission check passed successfully");
+            LogError("Permission check passed successfully");
         }
         catch (Exception ex)
         {
@@ -263,7 +288,10 @@ public sealed class WebFileStorage : IDisposable, IRegisteredObject
         var oFileId = Guid.NewGuid();
         var sTempPath = GetTempPath(oFileId);
         var sFinalPath = GetFilePath(oFileId);
-        int iBufferSize = oStream.CanSeek && lKnownLength.HasValue ? GetOptimizedBufferSize(lKnownLength.Value) : _DefaultBufferSize;
+        int iBufferSize = oStream.CanSeek && lKnownLength.HasValue
+            ? GetOptimizedBufferSize(lKnownLength.Value)
+            : _DefaultBufferSize;
+
         IncrementRef(oFileId);
         try
         {
@@ -300,22 +328,23 @@ public sealed class WebFileStorage : IDisposable, IRegisteredObject
         _CleanupCompleted.Reset();
         try
         {
-            LogMessage("Cleanup timer triggered");
+            LogError("Cleanup timer triggered");
             CleanupOldFiles();
         }
         catch (Exception ex)
         {
-            LogMessage($"Cleanup failed: {ex}");
+            LogError($"Cleanup failed: {ex}");
         }
         finally
         {
             Interlocked.Exchange(ref _CleanupRunning, 0);
             _CleanupCompleted.Set();
+            // تنظیم مجدد تایمر برای اجرای بعدی
             if (_Disposed == 0)
             {
                 int iMs = (int)Math.Min(TimeSpan.FromHours(_DeleteEveryHours).TotalMilliseconds, int.MaxValue);
                 _CleanupTimer?.Change(iMs, iMs);
-                LogMessage($"Cleanup timer reset for next run in {_DeleteEveryHours} hours");
+                LogError($"Cleanup timer reset for next run in {_DeleteEveryHours} hours");
             }
         }
     }
@@ -325,10 +354,11 @@ public sealed class WebFileStorage : IDisposable, IRegisteredObject
         try
         {
             var oCutoff = DateTime.UtcNow - TimeSpan.FromHours(_DeleteEveryHours);
-            LogMessage($"Cleanup started. Cutoff time: {oCutoff}");
+            LogError($"Cleanup started. Cutoff time: {oCutoff}");
             var oFilesToDelete = new List<string>();
             var oTempFilesToDelete = new List<string>();
             var oDirInfo = new DirectoryInfo(_StoragePath);
+            // جمع‌آوری فایل‌های .dat برای حذف
             foreach (var oFileInfo in oDirInfo.EnumerateFiles("*.dat"))
             {
                 try
@@ -346,45 +376,50 @@ public sealed class WebFileStorage : IDisposable, IRegisteredObject
                     if (!bHasActiveRef && oFileInfo.CreationTimeUtc < oCutoff)
                     {
                         oFilesToDelete.Add(oFileInfo.FullName);
-                        LogMessage($"File marked for deletion: {oFileInfo.FullName} (Created: {oFileInfo.CreationTimeUtc})");
+                        LogError($"File marked for deletion: {oFileInfo.FullName} (Created: {oFileInfo.CreationTimeUtc})");
                     }
                 }
                 catch (Exception ex)
                 {
-                    LogMessage($"Error processing file {oFileInfo.Name}: {ex}");
+                    LogError($"Error processing file {oFileInfo.Name}: {ex}");
                 }
             }
+            // جمع‌آوری فایل‌های موقت
             foreach (var oFileInfo in oDirInfo.EnumerateFiles("*.tmp"))
             {
                 oTempFilesToDelete.Add(oFileInfo.FullName);
-                LogMessage($"Temp file marked for deletion: {oFileInfo.FullName}");
+                LogError($"Temp file marked for deletion: {oFileInfo.FullName}");
             }
-            int deletedCount = 0;
-            int failedCount = 0;
+            int iDeletedCount = 0;
+            int iFailedCount = 0;
+            // حذف فایل‌های .dat
             foreach (var sFilePath in oFilesToDelete)
             {
                 if (SafeDeleteFile(sFilePath))
-                    deletedCount++;
+                    iDeletedCount++;
                 else
-                    failedCount++;
+                    iFailedCount++;
             }
+            // حذف فایل‌های موقت
             foreach (var sFilePath in oTempFilesToDelete)
             {
                 if (SafeDeleteFile(sFilePath))
-                    deletedCount++;
+                    iDeletedCount++;
                 else
-                    failedCount++;
+                    iFailedCount++;
             }
-            LogMessage($"Cleanup completed. Deleted: {deletedCount}, Failed: {failedCount}");
+
+            LogError($"Cleanup completed. Deleted: {iDeletedCount}, Failed: {iFailedCount}");
         }
         catch (Exception ex)
         {
-            LogMessage($"Global cleanup error: {ex}");
+            LogError($"Global cleanup error: {ex}");
         }
     }
 
     private string GetFilePath(Guid oFileId) => Path.Combine(_StoragePath, oFileId.ToString("N") + ".dat");
     private string GetTempPath(Guid oFileId) => Path.Combine(_StoragePath, oFileId.ToString("N") + ".tmp");
+
     private void IncrementRef(Guid oFileId)
     {
         lock (_RefsLock)
@@ -496,29 +531,29 @@ public sealed class WebFileStorage : IDisposable, IRegisteredObject
                 if (fileInfo.IsReadOnly)
                 {
                     fileInfo.IsReadOnly = false;
-                    LogMessage($"Removed read-only attribute from file: {sPath}");
+                    LogError($"Removed read-only attribute from file: {sPath}");
                 }
                 File.Delete(sPath);
-                LogMessage($"Successfully deleted file: {sPath}");
+                LogError($"Successfully deleted file: {sPath}");
                 return true;
             }
             catch (Exception ex) when (ex is FileNotFoundException || ex is DirectoryNotFoundException)
             {
-                return true; // فایل وجود ندارد . موفقیت‌آمیز در نظر گرفته می‌شود
+                return true; // فایل وجود ندارد - موفقیت‌آمیز در نظر گرفته می‌شود
             }
             catch (Exception ex) when (i < maxRetries - 1 && (ex is IOException || ex is UnauthorizedAccessException))
             {
-                LogMessage($"Attempt {i + 1} to delete file '{sPath}' failed: {ex.Message}. Retrying in {baseDelayMs * (i + 1)}ms...");
+                LogError($"Attempt {i + 1} to delete file '{sPath}' failed: {ex.Message}. Retrying in {baseDelayMs * (i + 1)}ms...");
                 Thread.Sleep(baseDelayMs * (i + 1));
             }
             catch (Exception ex)
             {
-                LogMessage($"Critical error deleting file '{sPath}': {ex}");
+                LogError($"Critical error deleting file '{sPath}': {ex}");
                 return false;
             }
         }
 
-        LogMessage($"Failed to delete file '{sPath}' after {maxRetries} attempts.");
+        LogError($"Failed to delete file '{sPath}' after {maxRetries} attempts.");
         return false;
     }
 
@@ -533,12 +568,12 @@ public sealed class WebFileStorage : IDisposable, IRegisteredObject
         return oEx is IOException || oEx is UnauthorizedAccessException || oEx is SecurityException;
     }
 
-    private void LogMessage(string sMessage)
+    private void LogError(string message)
     {
         try
         {
-            string sLogEntry = $"{DateTime.Now:yyyy-MM-dd HH:mm:ss}: {sMessage}{Environment.NewLine}";
-            File.AppendAllText(_LogFilePath, sLogEntry);
+            string logEntry = $"{DateTime.Now:yyyy-MM-dd HH:mm:ss}: {message}{Environment.NewLine}";
+            File.AppendAllText(_LogFilePath, logEntry);
         }
         catch { }
     }
@@ -552,9 +587,11 @@ public sealed class WebFileStorage : IDisposable, IRegisteredObject
     {
         if (Interlocked.CompareExchange(ref _Disposed, 1, 0) != 0)
             return;
+
         try
         {
             _CleanupTimer?.Change(Timeout.Infinite, Timeout.Infinite);
+
             if (_CleanupRunning != 0)
             {
                 _CleanupCompleted.Wait(TimeSpan.FromSeconds(5));
@@ -562,28 +599,33 @@ public sealed class WebFileStorage : IDisposable, IRegisteredObject
         }
         catch (Exception ex)
         {
-            LogMessage($"Error during timer disposal: {ex}");
+            LogError($"Error during timer disposal: {ex}");
         }
         finally
         {
             try
             {
                 _CleanupTimer?.Dispose();
-                HostingEnvironment.UnregisterObject(this);
+#if WEB
+                if (_RegisteredObject != null)
+                {
+                    HostingEnvironment.UnregisterObject(_RegisteredObject);
+                }
+#endif
             }
             catch (Exception ex)
             {
-                LogMessage($"Error disposing timer: {ex}");
+                LogError($"Error disposing timer: {ex}");
             }
-
             _ActiveRefs.Clear();
             _CleanupCompleted.Dispose();
         }
     }
 
-    void IRegisteredObject.Stop(bool immediate)
+#if WEB
+    void IRegisteredObject.Stop(bool blnImmediate)
     {
-        if (immediate)
+        if (blnImmediate)
         {
             Dispose();
         }
@@ -599,7 +641,7 @@ public sealed class WebFileStorage : IDisposable, IRegisteredObject
             }
             catch (Exception ex)
             {
-                LogMessage($"Error during graceful shutdown: {ex}");
+                LogError($"Error during graceful shutdown: {ex}");
             }
             finally
             {
@@ -607,4 +649,42 @@ public sealed class WebFileStorage : IDisposable, IRegisteredObject
             }
         }
     }
+
+    private class FileStorageRegisteredObject : IRegisteredObject
+    {
+        private readonly FileStorage _Storage;
+
+        public FileStorageRegisteredObject(FileStorage oStorage)
+        {
+            _Storage = oStorage;
+        }
+
+        public void Stop(bool blnImmediate)
+        {
+            if (blnImmediate)
+            {
+                _Storage.Dispose();
+            }
+            else
+            {
+                try
+                {
+                    _Storage._CleanupTimer?.Change(Timeout.Infinite, Timeout.Infinite);
+                    if (_Storage._CleanupRunning != 0)
+                    {
+                        _Storage._CleanupCompleted.Wait(TimeSpan.FromSeconds(10));
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _Storage.LogError($"Error during graceful shutdown: {ex}");
+                }
+                finally
+                {
+                    _Storage.Dispose();
+                }
+            }
+        }
+    }
+#endif
 }
