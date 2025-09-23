@@ -73,7 +73,7 @@ public sealed class ConditionalFileStorage : IDisposable
         var oDelay = TimeSpan.FromHours(iDeleteEveryHours);
         int iMs = (int)Math.Min((long)oDelay.TotalMilliseconds, int.MaxValue);
         _CleanupTimer = new Timer(OnCleanupTimer, null, 30000, iMs); // 30 ثانیه = 30000 میلی‌ثانیه
-        LogError($"FileStorage initialized. Path: {_StoragePath}, Cleanup interval: {iDeleteEveryHours} hours");
+        LogMessage($"FileStorage initialized. Path: {_StoragePath}, Cleanup interval: {iDeleteEveryHours} hours");
     }
 
     private void CheckPermissions()
@@ -84,7 +84,7 @@ public sealed class ConditionalFileStorage : IDisposable
             File.WriteAllText(testFile, "test");
             // بررسی امکان حذف فایل
             File.Delete(testFile);
-            LogError("Permission check passed successfully");
+            LogMessage("Permission check passed successfully");
         }
         catch (Exception ex)
         {
@@ -322,12 +322,12 @@ public sealed class ConditionalFileStorage : IDisposable
         _CleanupCompleted.Reset();
         try
         {
-            LogError("Cleanup timer triggered");
+            LogMessage("Cleanup timer triggered");
             CleanupOldFiles();
         }
         catch (Exception ex)
         {
-            LogError($"Cleanup failed: {ex}");
+            LogMessage($"Cleanup failed: {ex}");
         }
         finally
         {
@@ -338,7 +338,7 @@ public sealed class ConditionalFileStorage : IDisposable
             {
                 int iMs = (int)Math.Min(TimeSpan.FromHours(_DeleteEveryHours).TotalMilliseconds, int.MaxValue);
                 _CleanupTimer?.Change(iMs, iMs);
-                LogError($"Cleanup timer reset for next run in {_DeleteEveryHours} hours");
+                LogMessage($"Cleanup timer reset for next run in {_DeleteEveryHours} hours");
             }
         }
     }
@@ -348,7 +348,7 @@ public sealed class ConditionalFileStorage : IDisposable
         try
         {
             var oCutoff = DateTime.UtcNow - TimeSpan.FromHours(_DeleteEveryHours);
-            LogError($"Cleanup started. Cutoff time: {oCutoff}");
+            LogMessage($"Cleanup started. Cutoff time: {oCutoff}");
             var oFilesToDelete = new List<string>();
             var oTempFilesToDelete = new List<string>();
             var oDirInfo = new DirectoryInfo(_StoragePath);
@@ -370,19 +370,19 @@ public sealed class ConditionalFileStorage : IDisposable
                     if (!bHasActiveRef && oFileInfo.CreationTimeUtc < oCutoff)
                     {
                         oFilesToDelete.Add(oFileInfo.FullName);
-                        LogError($"File marked for deletion: {oFileInfo.FullName} (Created: {oFileInfo.CreationTimeUtc})");
+                        LogMessage($"File marked for deletion: {oFileInfo.FullName} (Created: {oFileInfo.CreationTimeUtc})");
                     }
                 }
                 catch (Exception ex)
                 {
-                    LogError($"Error processing file {oFileInfo.Name}: {ex}");
+                    LogMessage($"Error processing file {oFileInfo.Name}: {ex}");
                 }
             }
             // جمع‌آوری فایل‌های موقت
             foreach (var oFileInfo in oDirInfo.EnumerateFiles("*.tmp"))
             {
                 oTempFilesToDelete.Add(oFileInfo.FullName);
-                LogError($"Temp file marked for deletion: {oFileInfo.FullName}");
+                LogMessage($"Temp file marked for deletion: {oFileInfo.FullName}");
             }
             int iDeletedCount = 0;
             int iFailedCount = 0;
@@ -402,11 +402,11 @@ public sealed class ConditionalFileStorage : IDisposable
                 else
                     iFailedCount++;
             }
-            LogError($"Cleanup completed. Deleted: {iDeletedCount}, Failed: {iFailedCount}");
+            LogMessage($"Cleanup completed. Deleted: {iDeletedCount}, Failed: {iFailedCount}");
         }
         catch (Exception ex)
         {
-            LogError($"Global cleanup error: {ex}");
+            LogMessage($"Global cleanup error: {ex}");
         }
     }
 
@@ -522,11 +522,11 @@ public sealed class ConditionalFileStorage : IDisposable
                 if (fileInfo.IsReadOnly)
                 {
                     fileInfo.IsReadOnly = false;
-                    LogError($"Removed read-only attribute from file: {sPath}");
+                    LogMessage($"Removed read-only attribute from file: {sPath}");
                 }
                 // تلاش برای حذف فایل
                 File.Delete(sPath);
-                LogError($"Successfully deleted file: {sPath}");
+                LogMessage($"Successfully deleted file: {sPath}");
                 return true;
             }
             catch (Exception ex) when (ex is FileNotFoundException || ex is DirectoryNotFoundException)
@@ -535,17 +535,17 @@ public sealed class ConditionalFileStorage : IDisposable
             }
             catch (Exception ex) when (i < iMaxRetries - 1 && (ex is IOException || ex is UnauthorizedAccessException))
             {
-                LogError($"Attempt {i + 1} to delete file '{sPath}' failed: {ex.Message}. Retrying in {iBaseDelayMs * (i + 1)}ms...");
+                LogMessage($"Attempt {i + 1} to delete file '{sPath}' failed: {ex.Message}. Retrying in {iBaseDelayMs * (i + 1)}ms...");
                 Thread.Sleep(iBaseDelayMs * (i + 1));
             }
             catch (Exception ex)
             {
-                LogError($"Critical error deleting file '{sPath}': {ex}");
+                LogMessage($"Critical error deleting file '{sPath}': {ex}");
                 return false;
             }
         }
 
-        LogError($"Failed to delete file '{sPath}' after {iMaxRetries} attempts.");
+        LogMessage($"Failed to delete file '{sPath}' after {iMaxRetries} attempts.");
         return false;
     }
 
@@ -559,7 +559,7 @@ public sealed class ConditionalFileStorage : IDisposable
         return oEx is IOException || oEx is UnauthorizedAccessException || oEx is SecurityException;
     }
 
-    private void LogError(string message)
+    private void LogMessage(string message)
     {
         try
         {
@@ -590,7 +590,7 @@ public sealed class ConditionalFileStorage : IDisposable
         }
         catch (Exception ex)
         {
-            LogError($"Error during timer disposal: {ex}");
+            LogMessage($"Error during timer disposal: {ex}");
         }
         finally
         {
@@ -606,7 +606,7 @@ public sealed class ConditionalFileStorage : IDisposable
             }
             catch (Exception ex)
             {
-                LogError($"Error disposing timer: {ex}");
+                LogMessage($"Error disposing timer: {ex}");
             }
 
             _ActiveRefs.Clear();
