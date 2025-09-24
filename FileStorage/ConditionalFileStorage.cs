@@ -1,16 +1,13 @@
-﻿// برای استفاده در محیط‌های وب و ویندوزی
-// در پروژه‌های وب، باید نماد کامپایل شرطی "WEB" را تعریف کنید
-// در پروژه‌های ویندوزی، نیازی به تعریف این نماد نیست
-using System;
+﻿using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Security;
 using System.Security.Principal;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
-
 #if WEB
 using System.Web.Hosting;
 #endif
@@ -25,6 +22,7 @@ public sealed class ConditionalFileStorage : IDisposable
     private Timer _CleanupTimer;
     private readonly ManualResetEventSlim _CleanupCompleted = new ManualResetEventSlim(true);
     private readonly object _RefsLock = new object();
+    private readonly object _IndexLock = new object();
     private readonly double _FreeSpaceBufferRatio = 0.1;
     private volatile int _CleanupRunning;
     private volatile int _Disposed;
@@ -35,11 +33,19 @@ public sealed class ConditionalFileStorage : IDisposable
     private long _LastDiskCheckTime;
     private long _LastFreeSpace;
     private readonly string _LogFilePath;
-
+    private readonly string _IndexFilePath;
+    private List<FileIndexEntry> _FileIndex = new List<FileIndexEntry>();
+    private DateTime _LastIndexRebuild = DateTime.MinValue;
+    private const int _MaxIndexEntries = 10000;
+    private const int _IndexRebuildHours = 24;
 #if WEB
     private FileStorageRegisteredObject _RegisteredObject;
 #endif
-
+    private class FileIndexEntry
+    {
+        public string sId { get; set; }
+        public DateTime dtCreated { get; set; }
+    }
     public ConditionalFileStorage(string sPath, uint iDeleteEveryHours = 1)
     {
         if (string.IsNullOrWhiteSpace(sPath))
@@ -58,53 +64,328 @@ public sealed class ConditionalFileStorage : IDisposable
         Directory.CreateDirectory(_StoragePath);
         _DriveInfo = new DriveInfo(Path.GetPathRoot(_StoragePath));
         _LogFilePath = Path.Combine(_StoragePath, "FileStorageLogs.log");
-        // بررسی مجوزهای دسترسی
+        _IndexFilePath = Path.Combine(_StoragePath, "FileIndex.json");
         CheckPermissions();
-
+        CleanupTempIndexFiles();
+        LoadOrRebuildIndex();
 #if WEB
-        // ثبت در هاستینگ محیط برای جلوگیری از خاموش شدن تایمر
         if (HostingEnvironment.IsHosted)
         {
             _RegisteredObject = new FileStorageRegisteredObject(this);
             HostingEnvironment.RegisterObject(_RegisteredObject);
         }
 #endif
-        // ایجاد تایمر با اجرای اولیه بلافاصله
         var oDelay = TimeSpan.FromHours(iDeleteEveryHours);
         int iMs = (int)Math.Min((long)oDelay.TotalMilliseconds, int.MaxValue);
-        _CleanupTimer = new Timer(OnCleanupTimer, null, 30000, iMs); // 30 ثانیه = 30000 میلی‌ثانیه
-        LogMessage($"FileStorage initialized. Path: {_StoragePath}, Cleanup interval: {iDeleteEveryHours} hours");
+        _CleanupTimer = new Timer(OnCleanupTimer, null, 30000, iMs);
+        LogError($"FileStorage initialized. Path: {_StoragePath}, Cleanup interval: {iDeleteEveryHours} hours");
     }
+    private void LoadOrRebuildIndex()
+    {
+        lock (_IndexLock)
+        {
+            try
+            {
+                if (File.Exists(_IndexFilePath))
+                {
+                    string sJson = File.ReadAllText(_IndexFilePath);
+                    _FileIndex = Newtonsoft.Json.JsonConvert.DeserializeObject<List<FileIndexEntry>>(sJson) ?? new List<FileIndexEntry>();
+                    if (_FileIndex.Count > _MaxIndexEntries ||
+                        (DateTime.UtcNow - _LastIndexRebuild) > TimeSpan.FromHours(_IndexRebuildHours))
+                    {
+                        LogError($"Index needs rebuild. Entries: {_FileIndex.Count}, Last rebuild: {_LastIndexRebuild}");
+                        RebuildIndex();
+                    }
+                    else
+                    {
+                        LogError($"Index loaded successfully. Entries: {_FileIndex.Count}");
+                    }
+                }
+                else
+                {
+                    LogError("Index file not found. Rebuilding from existing files.");
+                    RebuildIndex();
+                }
+            }
+            catch (Exception ex)
+            {
+                LogError($"Failed to load index: {ex}. Rebuilding...");
+                RebuildIndex();
+            }
+        }
+    }
+    private void RebuildIndex()
+    {
+        lock (_IndexLock)
+        {
+            try
+            {
+                _FileIndex.Clear();
+                var oDirInfo = new DirectoryInfo(_StoragePath);
+                foreach (var oFileInfo in oDirInfo.EnumerateFiles("*.dat"))
+                {
+                    string sFileName = Path.GetFileNameWithoutExtension(oFileInfo.Name);
+                    if (Guid.TryParseExact(sFileName, "N", out Guid gGuid))
+                    {
+                        DateTime dtCreated = GetFileCreationTime(oFileInfo);
+                        _FileIndex.Add(new FileIndexEntry { sId = gGuid.ToString("N"), dtCreated = dtCreated });
+                    }
+                }
+                SaveIndex();
+                _LastIndexRebuild = DateTime.UtcNow;
+                LogError($"Index rebuilt successfully. Entries: {_FileIndex.Count}");
+            }
+            catch (Exception ex)
+            {
+                LogError($"Failed to rebuild index: {ex}");
+            }
+        }
+    }
+    //private void SaveIndex()
+    //{
+    //    lock (_oIndexLock)
+    //    {
+    //        const int iMaxRetries = 3;
+    //        const int iBaseDelayMs = 100;
+    //        string sTempPath = Path.Combine(_sStoragePath, "FileIndex.tmp");
+    //        for (int iAttempt = 1; iAttempt <= iMaxRetries; iAttempt++)
+    //        {
+    //            try
+    //            {
+    //                if (File.Exists(sTempPath))
+    //                {
+    //                    try { File.Delete(sTempPath); }
+    //                    catch { }
+    //                }
+    //                string sJson = Newtonsoft.Json.JsonConvert.SerializeObject(_lstFileIndex, Newtonsoft.Json.Formatting.Indented);
+    //                File.WriteAllText(sTempPath, sJson);
+    //                File.Replace(sTempPath, _sIndexFilePath, null);
+    //                return;
+    //            }
+    //            catch (Exception ex) when (iAttempt < iMaxRetries)
+    //            {
+    //                LogError($"Attempt {iAttempt} to save index failed: {ex.Message}. Retrying...");
+    //                Thread.Sleep(iBaseDelayMs * iAttempt);
+    //            }
+    //            catch (Exception ex)
+    //            {
+    //                LogError($"Failed to save index after {iMaxRetries} attempts: {ex}");
+    //                try
+    //                {
+    //                    string sBackupPath = Path.Combine(_sStoragePath, "FileIndex_backup.json");
+    //                    string sJson = Newtonsoft.Json.JsonConvert.SerializeObject(_lstFileIndex, Newtonsoft.Json.Formatting.Indented);
+    //                    File.WriteAllText(sBackupPath, sJson);
+    //                    if (File.Exists(_sIndexFilePath))
+    //                    {
+    //                        File.Delete(_sIndexFilePath);
+    //                    }
+    //                    File.Move(sBackupPath, _sIndexFilePath);
+    //                    LogError("Index saved using fallback method");
+    //                    return;
+    //                }
+    //                catch (Exception fallbackEx)
+    //                {
+    //                    LogError($"Fallback save also failed: {fallbackEx}");
+    //                }
+    //            }
+    //            finally
+    //            {
+    //                if (File.Exists(sTempPath))
+    //                {
+    //                    try { File.Delete(sTempPath); }
+    //                    catch { }
+    //                }
+    //            }
+    //        }
+    //    }
+    //}
+    private void SaveIndex()
+    {
+        lock (_IndexLock)
+        {
+            const int iMaxRetries = 3;
+            const int iBaseDelayMs = 100;
+            string sTempPath = Path.Combine(_StoragePath, "FileIndex.tmp");
+            for (int iAttempt = 1; iAttempt <= iMaxRetries; iAttempt++)
+            {
+                try
+                {
+                    if (File.Exists(sTempPath))
+                    {
+                        try { File.Delete(sTempPath); }
+                        catch { }
+                    }
+                    string sJson = Newtonsoft.Json.JsonConvert.SerializeObject(_FileIndex, Newtonsoft.Json.Formatting.Indented);
+                    File.WriteAllText(sTempPath, sJson);
 
+                    // بررسی وجود فایل مقصد قبل از جایگزینی
+                    if (File.Exists(_IndexFilePath))
+                    {
+                        File.Replace(sTempPath, _IndexFilePath, null);
+                    }
+                    else
+                    {
+                        // اگر فایل مقصد وجود ندارد، از Move استفاده کن
+                        File.Move(sTempPath, _IndexFilePath);
+                    }
+
+                    return;
+                }
+                catch (Exception ex) when (iAttempt < iMaxRetries)
+                {
+                    LogError($"Attempt {iAttempt} to save index failed: {ex.Message}. Retrying...");
+                    Thread.Sleep(iBaseDelayMs * iAttempt);
+                }
+                catch (Exception ex)
+                {
+                    LogError($"Failed to save index after {iMaxRetries} attempts: {ex}");
+                    try
+                    {
+                        string sBackupPath = Path.Combine(_StoragePath, "FileIndex_backup.json");
+                        string sJson = Newtonsoft.Json.JsonConvert.SerializeObject(_FileIndex, Newtonsoft.Json.Formatting.Indented);
+                        File.WriteAllText(sBackupPath, sJson);
+
+                        // بررسی وجود فایل مقصد قبل از جایگزینی
+                        if (File.Exists(_IndexFilePath))
+                        {
+                            File.Delete(_IndexFilePath);
+                        }
+                        File.Move(sBackupPath, _IndexFilePath);
+
+                        LogError("Index saved using fallback method");
+                        return;
+                    }
+                    catch (Exception fallbackEx)
+                    {
+                        LogError($"Fallback save also failed: {fallbackEx}");
+                    }
+                }
+                finally
+                {
+                    if (File.Exists(sTempPath))
+                    {
+                        try { File.Delete(sTempPath); }
+                        catch { }
+                    }
+                }
+            }
+        }
+    }
+    private void AddToIndex(Guid gFileId, DateTime dtCreated)
+    {
+        lock (_IndexLock)
+        {
+            _FileIndex.RemoveAll(e => e.sId == gFileId.ToString("N"));
+            _FileIndex.Add(new FileIndexEntry { sId = gFileId.ToString("N"), dtCreated = dtCreated });
+            SaveIndex();
+        }
+    }
+    private void RemoveFromIndex(Guid gFileId)
+    {
+        lock (_IndexLock)
+        {
+            _FileIndex.RemoveAll(e => e.sId == gFileId.ToString("N"));
+            SaveIndex();
+        }
+    }
+    private void RemoveStaleEntries()
+    {
+        lock (_IndexLock)
+        {
+            var lstEntriesToRemove = new List<FileIndexEntry>();
+            foreach (var oEntry in _FileIndex)
+            {
+                string sFilePath = Path.Combine(_StoragePath, oEntry.sId + ".dat");
+                if (!File.Exists(sFilePath))
+                {
+                    lstEntriesToRemove.Add(oEntry);
+                }
+            }
+            foreach (var oEntry in lstEntriesToRemove)
+            {
+                _FileIndex.Remove(oEntry);
+            }
+            if (lstEntriesToRemove.Count > 0)
+            {
+                SaveIndex();
+                LogError($"Removed {lstEntriesToRemove.Count} stale entries from index");
+            }
+        }
+    }
+    private void CleanupTempIndexFiles()
+    {
+        try
+        {
+            var oDirInfo = new DirectoryInfo(_StoragePath);
+            var sTempFiles = new[] { "FileIndex.tmp", "FileIndex_backup.json" };
+            foreach (var sPattern in sTempFiles)
+            {
+                var oFiles = oDirInfo.GetFiles(sPattern);
+                foreach (var oFile in oFiles)
+                {
+                    try
+                    {
+                        if (DateTime.UtcNow - oFile.CreationTimeUtc > TimeSpan.FromHours(1))
+                        {
+                            oFile.Delete();
+                            LogError($"Deleted old temp file: {oFile.Name}");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        LogError($"Failed to delete temp file {oFile.Name}: {ex}");
+                    }
+                }
+            }
+            foreach (var oFile in oDirInfo.GetFiles("FileIndex_*.tmp"))
+            {
+                try
+                {
+                    if (DateTime.UtcNow - oFile.CreationTimeUtc > TimeSpan.FromHours(1))
+                    {
+                        oFile.Delete();
+                        LogError($"Deleted old random temp file: {oFile.Name}");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    LogError($"Failed to delete random temp file {oFile.Name}: {ex}");
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            LogError($"Failed to cleanup temp files: {ex}");
+        }
+    }
     private void CheckPermissions()
     {
         try
         {
-            string testFile = Path.Combine(_StoragePath, "permission_test.tmp");
-            File.WriteAllText(testFile, "test");
-            // بررسی امکان حذف فایل
-            File.Delete(testFile);
-            LogMessage("Permission check passed successfully");
+            string sTestFile = Path.Combine(_StoragePath, "permission_test.tmp");
+            File.WriteAllText(sTestFile, "test");
+            File.Delete(sTestFile);
+            LogError("Permission check passed successfully");
         }
         catch (Exception ex)
         {
-            string currentUser = WindowsIdentity.GetCurrent().Name;
-            throw new Exception($"The application does not have write/delete permissions on the storage path: {_StoragePath}. " + $"Current user: {currentUser}. " +
+            string sCurrentUser = WindowsIdentity.GetCurrent().Name;
+            throw new Exception(
+                $"The application does not have write/delete permissions on the storage path: {_StoragePath}. " +
+                $"Current user: {sCurrentUser}. " +
                 $"Please grant 'Modify' permissions to the Application Pool identity. Error: {ex.Message}", ex);
         }
     }
-
     public Guid SaveFile(Stream oFileStream) => SaveFileCore(oFileStream);
     public Guid SaveFile(byte[] oFileData) => SaveFileCore(new MemoryStream(oFileData), oFileData.Length);
     public Guid SaveFile(string sBase64) => SaveFile(Convert.FromBase64String(sBase64));
     public Task<Guid> SaveFileAsync(Stream oFileStream, CancellationToken oCt = default) => SaveFileCoreAsync(oFileStream, null, oCt);
     public Task<Guid> SaveFileAsync(byte[] oFileData, CancellationToken oCt = default) => SaveFileCoreAsync(new MemoryStream(oFileData), oFileData.Length, oCt);
     public Task<Guid> SaveFileAsync(string sBase64, CancellationToken oCt = default) => SaveFileAsync(Convert.FromBase64String(sBase64), oCt);
-
-    public Stream GetFile(Guid oFileId)
+    public Stream GetFile(Guid gFileId)
     {
         CheckDisposed();
-        var sFilePath = GetFilePath(oFileId);
+        var sFilePath = GetFilePath(gFileId);
         try
         {
             return new FileStream(
@@ -120,12 +401,11 @@ public sealed class ConditionalFileStorage : IDisposable
             throw new FileNotFoundException("File not found.", sFilePath, ex);
         }
     }
-
-    public async Task<Stream> GetFileAsync(Guid oFileId, CancellationToken oCt = default)
+    public async Task<Stream> GetFileAsync(Guid gFileId, CancellationToken oCt = default)
     {
         CheckDisposed();
         oCt.ThrowIfCancellationRequested();
-        var sFilePath = GetFilePath(oFileId);
+        var sFilePath = GetFilePath(gFileId);
         if (!File.Exists(sFilePath))
             throw new FileNotFoundException("File not found.", sFilePath);
         try
@@ -143,22 +423,21 @@ public sealed class ConditionalFileStorage : IDisposable
             throw new FileNotFoundException("File not found.", sFilePath, ex);
         }
     }
-
-    public byte[] GetFileBytes(Guid oFileId)
+    public byte[] GetFileBytes(Guid gFileId)
     {
         CheckDisposed();
-        var sFilePath = GetFilePath(oFileId);
+        var sFilePath = GetFilePath(gFileId);
         if (!File.Exists(sFilePath))
             throw new FileNotFoundException("File not found.", sFilePath);
-        var iFileSize = new FileInfo(sFilePath).Length;
-        if (iFileSize > _MaxFileSize)
+        var lFileSize = new FileInfo(sFilePath).Length;
+        if (lFileSize > _MaxFileSize)
             throw new IOException($"File is too large to load into memory (max {_MaxFileSize} bytes).");
-        IncrementRef(oFileId);
+        IncrementRef(gFileId);
         try
         {
             return ExecuteWithRetry(() =>
             {
-                int iBufferSize = GetOptimizedBufferSize(iFileSize);
+                int iBufferSize = GetOptimizedBufferSize(lFileSize);
                 using (var oStream = new FileStream(
                     sFilePath,
                     FileMode.Open,
@@ -182,25 +461,24 @@ public sealed class ConditionalFileStorage : IDisposable
         }
         finally
         {
-            DecrementRef(oFileId);
+            DecrementRef(gFileId);
         }
     }
-
-    public async Task<byte[]> GetFileBytesAsync(Guid oFileId, CancellationToken oCt = default)
+    public async Task<byte[]> GetFileBytesAsync(Guid gFileId, CancellationToken oCt = default)
     {
         CheckDisposed();
-        var sFilePath = GetFilePath(oFileId);
+        var sFilePath = GetFilePath(gFileId);
         if (!File.Exists(sFilePath))
             throw new FileNotFoundException("File not found.", sFilePath);
-        var iFileSize = new FileInfo(sFilePath).Length;
-        if (iFileSize > _MaxFileSize)
+        var lFileSize = new FileInfo(sFilePath).Length;
+        if (lFileSize > _MaxFileSize)
             throw new IOException($"File is too large to load into memory (max {_MaxFileSize} bytes).");
-        IncrementRef(oFileId);
+        IncrementRef(gFileId);
         try
         {
             return await ExecuteWithRetryAsync(async () =>
             {
-                int iBufferSize = GetOptimizedBufferSize(iFileSize);
+                int iBufferSize = GetOptimizedBufferSize(lFileSize);
                 using (var oStream = new FileStream(
                     sFilePath,
                     FileMode.Open,
@@ -224,10 +502,9 @@ public sealed class ConditionalFileStorage : IDisposable
         }
         finally
         {
-            DecrementRef(oFileId);
+            DecrementRef(gFileId);
         }
     }
-
     private int GetOptimizedBufferSize(long lFileSize)
     {
         if (lFileSize <= 8192) return 8192;
@@ -235,7 +512,6 @@ public sealed class ConditionalFileStorage : IDisposable
         if (lFileSize <= 524288) return 32768;
         return 65536;
     }
-
     private Guid SaveFileCore(Stream oStream, long? lKnownLength = null)
     {
         CheckDisposed();
@@ -243,12 +519,11 @@ public sealed class ConditionalFileStorage : IDisposable
             throw new ArgumentNullException(nameof(oStream));
         long lFileSize = lKnownLength ?? (oStream.CanSeek ? oStream.Length : _MaxFileSize);
         EnsureDiskSpace(lFileSize);
-        var oFileId = Guid.NewGuid();
-        var sTempPath = GetTempPath(oFileId);
-        var sFinalPath = GetFilePath(oFileId);
+        var gFileId = Guid.NewGuid();
+        var sTempPath = GetTempPath(gFileId);
+        var sFinalPath = GetFilePath(gFileId);
         int iBufferSize = oStream.CanSeek && lKnownLength.HasValue ? GetOptimizedBufferSize(lKnownLength.Value) : _DefaultBufferSize;
-
-        IncrementRef(oFileId);
+        IncrementRef(gFileId);
         try
         {
             ExecuteWithRetry(() =>
@@ -264,17 +539,17 @@ public sealed class ConditionalFileStorage : IDisposable
                     oStream.CopyTo(oFs, iBufferSize);
                 }
                 File.Move(sTempPath, sFinalPath);
+                AddToIndex(gFileId, DateTime.UtcNow);
             });
         }
         catch
         {
             SafeDeleteFile(sTempPath);
-            DecrementRef(oFileId);
+            DecrementRef(gFileId);
             throw;
         }
-        return oFileId;
+        return gFileId;
     }
-
     private async Task<Guid> SaveFileCoreAsync(Stream oStream, long? lKnownLength, CancellationToken oCt = default)
     {
         CheckDisposed();
@@ -282,11 +557,13 @@ public sealed class ConditionalFileStorage : IDisposable
             throw new ArgumentNullException(nameof(oStream));
         long lFileSize = lKnownLength ?? (oStream.CanSeek ? oStream.Length : _MaxFileSize);
         EnsureDiskSpace(lFileSize);
-        var oFileId = Guid.NewGuid();
-        var sTempPath = GetTempPath(oFileId);
-        var sFinalPath = GetFilePath(oFileId);
-        int iBufferSize = oStream.CanSeek && lKnownLength.HasValue ? GetOptimizedBufferSize(lKnownLength.Value) : _DefaultBufferSize;
-        IncrementRef(oFileId);
+        var gFileId = Guid.NewGuid();
+        var sTempPath = GetTempPath(gFileId);
+        var sFinalPath = GetFilePath(gFileId);
+        int iBufferSize = oStream.CanSeek && lKnownLength.HasValue
+            ? GetOptimizedBufferSize(lKnownLength.Value)
+            : _DefaultBufferSize;
+        IncrementRef(gFileId);
         try
         {
             await ExecuteWithRetryAsync(async () =>
@@ -302,17 +579,17 @@ public sealed class ConditionalFileStorage : IDisposable
                     await oStream.CopyToAsync(oFs, iBufferSize, oCt).ConfigureAwait(false);
                 }
                 File.Move(sTempPath, sFinalPath);
+                AddToIndex(gFileId, DateTime.UtcNow);
             }, oCt).ConfigureAwait(false);
         }
         catch
         {
             SafeDeleteFile(sTempPath);
-            DecrementRef(oFileId);
+            DecrementRef(gFileId);
             throw;
         }
-        return oFileId;
+        return gFileId;
     }
-
     private void OnCleanupTimer(object oState)
     {
         if (_Disposed != 0)
@@ -322,117 +599,149 @@ public sealed class ConditionalFileStorage : IDisposable
         _CleanupCompleted.Reset();
         try
         {
-            LogMessage("Cleanup timer triggered");
+            LogError("Cleanup timer triggered");
+            CleanupTempIndexFiles();
             CleanupOldFiles();
         }
         catch (Exception ex)
         {
-            LogMessage($"Cleanup failed: {ex}");
+            LogError($"Cleanup failed: {ex}");
         }
         finally
         {
             Interlocked.Exchange(ref _CleanupRunning, 0);
             _CleanupCompleted.Set();
-            // تنظیم مجدد تایمر برای اجرای بعدی
             if (_Disposed == 0)
             {
                 int iMs = (int)Math.Min(TimeSpan.FromHours(_DeleteEveryHours).TotalMilliseconds, int.MaxValue);
                 _CleanupTimer?.Change(iMs, iMs);
-                LogMessage($"Cleanup timer reset for next run in {_DeleteEveryHours} hours");
+                LogError($"Cleanup timer reset for next run in {_DeleteEveryHours} hours");
             }
         }
     }
-
     private void CleanupOldFiles()
     {
         try
         {
-            var oCutoff = DateTime.UtcNow - TimeSpan.FromHours(_DeleteEveryHours);
-            LogMessage($"Cleanup started. Cutoff time: {oCutoff}");
-            var oFilesToDelete = new List<string>();
-            var oTempFilesToDelete = new List<string>();
-            var oDirInfo = new DirectoryInfo(_StoragePath);
-            // جمع‌آوری فایل‌های .dat برای حذف
-            foreach (var oFileInfo in oDirInfo.EnumerateFiles("*.dat"))
+            var dtCutoff = DateTime.UtcNow - TimeSpan.FromHours(_DeleteEveryHours);
+            LogError($"Cleanup started. Cutoff time (UTC): {dtCutoff}");
+            RemoveStaleEntries();
+            if ((DateTime.UtcNow - _LastIndexRebuild) > TimeSpan.FromHours(_IndexRebuildHours))
             {
-                try
-                {
-                    var sFileName = Path.GetFileNameWithoutExtension(oFileInfo.Name);
-                    if (!Guid.TryParseExact(sFileName, "N", out var oFileId))
-                        continue;
-
-                    bool bHasActiveRef;
-                    lock (_RefsLock)
-                    {
-                        bHasActiveRef = _ActiveRefs.TryGetValue(oFileId, out int iCount) && iCount > 0;
-                    }
-
-                    if (!bHasActiveRef && oFileInfo.CreationTimeUtc < oCutoff)
-                    {
-                        oFilesToDelete.Add(oFileInfo.FullName);
-                        LogMessage($"File marked for deletion: {oFileInfo.FullName} (Created: {oFileInfo.CreationTimeUtc})");
-                    }
-                }
-                catch (Exception ex)
-                {
-                    LogMessage($"Error processing file {oFileInfo.Name}: {ex}");
-                }
+                LogError("Scheduled index rebuild");
+                RebuildIndex();
             }
-            // جمع‌آوری فایل‌های موقت
-            foreach (var oFileInfo in oDirInfo.EnumerateFiles("*.tmp"))
+            var lstEntriesToDelete = new List<FileIndexEntry>();
+            lock (_IndexLock)
             {
-                oTempFilesToDelete.Add(oFileInfo.FullName);
-                LogMessage($"Temp file marked for deletion: {oFileInfo.FullName}");
+                foreach (var oEntry in _FileIndex)
+                {
+                    if (oEntry.dtCreated < dtCutoff)
+                    {
+                        if (Guid.TryParseExact(oEntry.sId, "N", out Guid gFileId))
+                        {
+                            bool bHasActiveRef;
+                            lock (_RefsLock)
+                            {
+                                bHasActiveRef = _ActiveRefs.TryGetValue(gFileId, out int iCount) && iCount > 0;
+                            }
+                            if (!bHasActiveRef)
+                            {
+                                lstEntriesToDelete.Add(oEntry);
+                            }
+                        }
+                    }
+                }
             }
             int iDeletedCount = 0;
             int iFailedCount = 0;
-            // حذف فایل‌های .dat
-            foreach (var sFilePath in oFilesToDelete)
+            foreach (var oEntry in lstEntriesToDelete)
             {
-                if (SafeDeleteFile(sFilePath))
+                string sFilePath = Path.Combine(_StoragePath, oEntry.sId + ".dat");
+                if (DeleteFileAndRemoveFromIndex(sFilePath, oEntry))
+                {
                     iDeletedCount++;
+                    LogError($"Deleted old file: {oEntry.sId}");
+                }
                 else
+                {
                     iFailedCount++;
+                    LogError($"Failed to delete file: {oEntry.sId}");
+                }
             }
-            // حذف فایل‌های موقت
-            foreach (var sFilePath in oTempFilesToDelete)
+            var oDirInfo = new DirectoryInfo(_StoragePath);
+            foreach (var oFileInfo in oDirInfo.EnumerateFiles("*.tmp"))
             {
-                if (SafeDeleteFile(sFilePath))
+                if (oFileInfo.Name.Equals("FileIndex.tmp", StringComparison.OrdinalIgnoreCase))
+                    continue;
+                if (SafeDeleteFile(oFileInfo.FullName))
+                {
                     iDeletedCount++;
+                    LogError($"Deleted temp file: {oFileInfo.Name}");
+                }
                 else
+                {
                     iFailedCount++;
+                }
             }
-            LogMessage($"Cleanup completed. Deleted: {iDeletedCount}, Failed: {iFailedCount}");
+            LogError($"Cleanup completed. Deleted: {iDeletedCount}, Failed: {iFailedCount}");
         }
         catch (Exception ex)
         {
-            LogMessage($"Global cleanup error: {ex}");
+            LogError($"Global cleanup error: {ex}");
         }
     }
-
-    private string GetFilePath(Guid oFileId) => Path.Combine(_StoragePath, oFileId.ToString("N") + ".dat");
-    private string GetTempPath(Guid oFileId) => Path.Combine(_StoragePath, oFileId.ToString("N") + ".tmp");
-
-    private void IncrementRef(Guid oFileId)
+    private bool DeleteFileAndRemoveFromIndex(string sFilePath, FileIndexEntry oEntry)
     {
-        lock (_RefsLock)
+        if (SafeDeleteFile(sFilePath))
         {
-            _ActiveRefs.AddOrUpdate(oFileId, 1, (key, value) => value + 1);
-        }
-    }
-
-    private void DecrementRef(Guid oFileId)
-    {
-        lock (_RefsLock)
-        {
-            int iNewValue = _ActiveRefs.AddOrUpdate(oFileId, 0, (key, value) => value - 1);
-            if (iNewValue <= 0)
+            lock (_IndexLock)
             {
-                _ActiveRefs.TryRemove(oFileId, out _);
+                _FileIndex.Remove(oEntry);
+                SaveIndex();
+            }
+            return true;
+        }
+        return false;
+    }
+    private DateTime GetFileCreationTime(FileInfo oFileInfo)
+    {
+        try
+        {
+            return oFileInfo.CreationTimeUtc;
+        }
+        catch
+        {
+            try
+            {
+                return oFileInfo.CreationTime.ToUniversalTime();
+            }
+            catch
+            {
+                return oFileInfo.LastWriteTimeUtc;
             }
         }
     }
-
+    private string GetFilePath(Guid gFileId) => Path.Combine(_StoragePath, gFileId.ToString("N") + ".dat");
+    private string GetTempPath(Guid gFileId) => Path.Combine(_StoragePath, gFileId.ToString("N") + ".tmp");
+    private void IncrementRef(Guid gFileId)
+    {
+        lock (_RefsLock)
+        {
+            _ActiveRefs.AddOrUpdate(gFileId, 1, (key, value) => value + 1);
+        }
+    }
+    private void DecrementRef(Guid gFileId)
+    {
+        lock (_RefsLock)
+        {
+            int iNewValue = _ActiveRefs.AddOrUpdate(gFileId, 0, (key, value) => value - 1);
+            if (iNewValue <= 0)
+            {
+                _ActiveRefs.TryRemove(gFileId, out _);
+            }
+        }
+    }
     private T ExecuteWithRetry<T>(Func<T> oFunc, int iMaxRetries = 2, int iBaseDelay = 5)
     {
         for (int i = 0; i < iMaxRetries; i++)
@@ -448,7 +757,6 @@ public sealed class ConditionalFileStorage : IDisposable
         }
         throw new IOException("File operation failed after retries");
     }
-
     private void ExecuteWithRetry(Action oAction, int iMaxRetries = 2, int iBaseDelay = 5)
     {
         ExecuteWithRetry(() =>
@@ -457,7 +765,6 @@ public sealed class ConditionalFileStorage : IDisposable
             return true;
         }, iMaxRetries, iBaseDelay);
     }
-
     private async Task<T> ExecuteWithRetryAsync<T>(Func<Task<T>> oFunc, CancellationToken oCt = default, int iMaxRetries = 2, int iBaseDelay = 5)
     {
         for (int i = 0; i < iMaxRetries; i++)
@@ -475,7 +782,6 @@ public sealed class ConditionalFileStorage : IDisposable
         }
         throw new IOException("Async file operation failed after retries");
     }
-
     private async Task ExecuteWithRetryAsync(Func<Task> oAction, CancellationToken oCt = default, int iMaxRetries = 2, int iBaseDelay = 5)
     {
         await ExecuteWithRetryAsync(async () =>
@@ -484,7 +790,6 @@ public sealed class ConditionalFileStorage : IDisposable
             return true;
         }, oCt, iMaxRetries, iBaseDelay).ConfigureAwait(false);
     }
-
     private void EnsureDiskSpace(long lRequiredSpace)
     {
         long lNow = Stopwatch.GetTimestamp();
@@ -506,7 +811,6 @@ public sealed class ConditionalFileStorage : IDisposable
                 throw new IOException("Not enough disk space available.");
         }
     }
-
     private bool SafeDeleteFile(string sPath)
     {
         const int iMaxRetries = 3;
@@ -517,72 +821,107 @@ public sealed class ConditionalFileStorage : IDisposable
             {
                 if (!File.Exists(sPath))
                     return true;
-                // بررسی ویژگی فقط-خواندنی
-                var fileInfo = new FileInfo(sPath);
-                if (fileInfo.IsReadOnly)
+                var oFileInfo = new FileInfo(sPath);
+                if (oFileInfo.IsReadOnly)
                 {
-                    fileInfo.IsReadOnly = false;
-                    LogMessage($"Removed read-only attribute from file: {sPath}");
+                    oFileInfo.IsReadOnly = false;
+                    LogError($"Removed read-only attribute from file: {sPath}");
                 }
-                // تلاش برای حذف فایل
                 File.Delete(sPath);
-                LogMessage($"Successfully deleted file: {sPath}");
+                LogError($"Successfully deleted file: {sPath}");
                 return true;
             }
             catch (Exception ex) when (ex is FileNotFoundException || ex is DirectoryNotFoundException)
             {
-                return true; // فایل وجود ندارد - موفقیت‌آمیز در نظر گرفته می‌شود
+                return true;
             }
             catch (Exception ex) when (i < iMaxRetries - 1 && (ex is IOException || ex is UnauthorizedAccessException))
             {
-                LogMessage($"Attempt {i + 1} to delete file '{sPath}' failed: {ex.Message}. Retrying in {iBaseDelayMs * (i + 1)}ms...");
+                LogError($"Attempt {i + 1} to delete file '{sPath}' failed: {ex.Message}. Retrying in {iBaseDelayMs * (i + 1)}ms...");
                 Thread.Sleep(iBaseDelayMs * (i + 1));
             }
             catch (Exception ex)
             {
-                LogMessage($"Critical error deleting file '{sPath}': {ex}");
+                LogError($"Critical error deleting file '{sPath}': {ex}");
                 return false;
             }
         }
-
-        LogMessage($"Failed to delete file '{sPath}' after {iMaxRetries} attempts.");
+        LogError($"Failed to delete file '{sPath}' after {iMaxRetries} attempts.");
         return false;
     }
-
     private void CheckDisposed()
     {
-        if (_Disposed != 0) throw new ObjectDisposedException("FileStorage");
+        if (_Disposed != 0)
+            throw new ObjectDisposedException("FileStorage");
     }
-
     private bool IsTransientFileError(Exception oEx)
     {
         return oEx is IOException || oEx is UnauthorizedAccessException || oEx is SecurityException;
     }
-
-    private void LogMessage(string sMessage)
+    private void LogError(string sMessage)
     {
         try
         {
-            string logEntry = $"{DateTime.Now:yyyy-MM-dd HH:mm:ss}: {sMessage}{Environment.NewLine}";
-            File.AppendAllText(_LogFilePath, logEntry);
+            string sLogEntry = $"{DateTime.Now:yyyy-MM-dd HH:mm:ss}: {sMessage}{Environment.NewLine}";
+            File.AppendAllText(_LogFilePath, sLogEntry);
         }
         catch { }
     }
-
     public void ForceCleanup()
     {
         OnCleanupTimer(null);
     }
-
+    public void ForceCleanupOldFiles(int iHoursAgo = 24)
+    {
+        var dtCutoff = DateTime.UtcNow - TimeSpan.FromHours(iHoursAgo);
+        LogError($"Forced cleanup. Cutoff time (UTC): {dtCutoff}");
+        var lstEntriesToDelete = new List<FileIndexEntry>();
+        lock (_IndexLock)
+        {
+            foreach (var oEntry in _FileIndex)
+            {
+                if (oEntry.dtCreated < dtCutoff)
+                {
+                    if (Guid.TryParseExact(oEntry.sId, "N", out Guid gFileId))
+                    {
+                        bool bHasActiveRef;
+                        lock (_RefsLock)
+                        {
+                            bHasActiveRef = _ActiveRefs.TryGetValue(gFileId, out int iCount) && iCount > 0;
+                        }
+                        if (!bHasActiveRef)
+                        {
+                            lstEntriesToDelete.Add(oEntry);
+                        }
+                    }
+                }
+            }
+        }
+        foreach (var oEntry in lstEntriesToDelete)
+        {
+            string sFilePath = Path.Combine(_StoragePath, oEntry.sId + ".dat");
+            if (DeleteFileAndRemoveFromIndex(sFilePath, oEntry))
+            {
+                LogError($"Force deleted: {oEntry.sId}");
+            }
+            else
+            {
+                LogError($"Failed to force delete: {oEntry.sId}");
+            }
+        }
+    }
+    public void RebuildIndexManually()
+    {
+        LogError("Manual index rebuild requested");
+        RebuildIndex();
+    }
     public void Dispose()
     {
         if (Interlocked.CompareExchange(ref _Disposed, 1, 0) != 0)
             return;
-
         try
         {
             _CleanupTimer?.Change(Timeout.Infinite, Timeout.Infinite);
-
             if (_CleanupRunning != 0)
             {
                 _CleanupCompleted.Wait(TimeSpan.FromSeconds(5));
@@ -590,7 +929,7 @@ public sealed class ConditionalFileStorage : IDisposable
         }
         catch (Exception ex)
         {
-            LogMessage($"Error during timer disposal: {ex}");
+            LogError($"Error during timer disposal: {ex}");
         }
         finally
         {
@@ -606,18 +945,16 @@ public sealed class ConditionalFileStorage : IDisposable
             }
             catch (Exception ex)
             {
-                LogMessage($"Error disposing timer: {ex}");
+                LogError($"Error disposing timer: {ex}");
             }
-
             _ActiveRefs.Clear();
             _CleanupCompleted.Dispose();
         }
     }
-
 #if WEB
-    void IRegisteredObject.Stop(bool blnImmediate)
+    void IRegisteredObject.Stop(bool bImmediate)
     {
-        if (blnImmediate)
+        if (bImmediate)
         {
             Dispose();
         }
@@ -641,39 +978,36 @@ public sealed class ConditionalFileStorage : IDisposable
             }
         }
     }
-
     private class FileStorageRegisteredObject : IRegisteredObject
     {
-        private readonly ConditionalFileStorage _Storage;
-
-        public FileStorageRegisteredObject(ConditionalFileStorage storage)
+        private readonly ConditionalFileStorage _oStorage;
+        public FileStorageRegisteredObject(ConditionalFileStorage oStorage)
         {
-            _Storage = storage;
+            _oStorage = oStorage;
         }
-
-        public void Stop(bool blnImmediate)
+        public void Stop(bool bImmediate)
         {
-            if (blnImmediate)
+            if (bImmediate)
             {
-                _Storage.Dispose();
+                _oStorage.Dispose();
             }
             else
             {
                 try
                 {
-                    _Storage._CleanupTimer?.Change(Timeout.Infinite, Timeout.Infinite);
-                    if (_Storage._CleanupRunning != 0)
+                    _oStorage._CleanupTimer?.Change(Timeout.Infinite, Timeout.Infinite);
+                    if (_oStorage._CleanupRunning != 0)
                     {
-                        _Storage._CleanupCompleted.Wait(TimeSpan.FromSeconds(10));
+                        _oStorage._CleanupCompleted.Wait(TimeSpan.FromSeconds(10));
                     }
                 }
                 catch (Exception ex)
                 {
-                    _Storage.LogError($"Error during graceful shutdown: {ex}");
+                    _oStorage.LogError($"Error during graceful shutdown: {ex}");
                 }
                 finally
                 {
-                    _Storage.Dispose();
+                    _oStorage.Dispose();
                 }
             }
         }
