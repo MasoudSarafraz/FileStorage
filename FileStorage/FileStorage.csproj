@@ -48,7 +48,6 @@
   <ItemGroup>
     <Compile Include="FileStorage.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
-    <Compile Include="ConditionalFileStorage.cs" />
   </ItemGroup>
   <ItemGroup>
     <None Include="packages.config" />
