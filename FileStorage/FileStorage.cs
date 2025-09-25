@@ -947,14 +947,56 @@ public sealed class FileStorage : IDisposable
     {
         return oEx is IOException || oEx is UnauthorizedAccessException || oEx is SecurityException;
     }
+    //private void LogMessage(string sMessage)
+    //{
+    //    try
+    //    {
+    //        string sLogEntry = $"UtcTime:{DateTime.UtcNow:yyyy-MM-dd HH:mm:ss}=>LocalTime:{DateTime.Now:yyyy-MM-dd HH:mm:ss}: {sMessage}{Environment.NewLine}";
+    //        File.AppendAllText(_LogFilePath, sLogEntry, Encoding.UTF8);
+    //    }
+    //    catch { }
+    //}
     private void LogMessage(string sMessage)
     {
-        try
+        const int iMaxRetries = 2;
+        const int iBaseDelayMs = 100;
+        void TryLog(int iAttempt)
         {
-            string sLogEntry = $"UtcTime:{DateTime.UtcNow:yyyy-MM-dd HH:mm:ss}=>LocalTime:{DateTime.Now:yyyy-MM-dd HH:mm:ss}: {sMessage}{Environment.NewLine}";
-            File.AppendAllText(_LogFilePath, sLogEntry, Encoding.UTF8);
+            if (iAttempt >= iMaxRetries)
+                return;
+            try
+            {
+                string sLogEntry = $"UtcTime:{DateTime.UtcNow:yyyy-MM-dd HH:mm:ss}=>LocalTime:{DateTime.Now:yyyy-MM-dd HH:mm:ss}: {sMessage}{Environment.NewLine}";
+                File.AppendAllText(_LogFilePath, sLogEntry, Encoding.UTF8);
+                return;
+            }
+            catch (Exception ex)
+            {
+                if (iAttempt == iMaxRetries - 1)
+                    return;
+                bool bIsFileNotFound = ex is FileNotFoundException || (ex is IOException && ex.Message.Contains("Could not find")) || (ex is IOException && ex.Message.Contains("The system cannot find the file"));
+                if (bIsFileNotFound)
+                {
+                    try
+                    {
+                        File.WriteAllText(_LogFilePath, $"Log File Created At UtcTime {DateTime.UtcNow:yyyy-MM-dd HH:mm:ss} LocalTime {DateTime.Now:yyyy-MM-dd HH:mm:ss}{Environment.NewLine}", Encoding.UTF8);
+                        Thread.Sleep(iBaseDelayMs);
+                        TryLog(iAttempt + 1);
+                    }
+                    catch
+                    {
+                        // در صورت شکست در ایجاد فایل، تلاش متوقف می‌شود
+                        return;
+                    }
+                }
+                else
+                {
+                    Thread.Sleep(iBaseDelayMs * (iAttempt + 1));
+                    TryLog(iAttempt + 1);
+                }
+            }
         }
-        catch { }
+        TryLog(0);
     }
     public void ForceCleanup()
     {
