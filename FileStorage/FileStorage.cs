@@ -951,7 +951,7 @@ public sealed class FileStorage : IDisposable
     {
         try
         {
-            string sLogEntry = $"{DateTime.Now:yyyy-MM-dd HH:mm:ss}: {sMessage}{Environment.NewLine}";
+            string sLogEntry = $"UtcTime:{DateTime.UtcNow:yyyy-MM-dd HH:mm:ss}=>LocalTime:{DateTime.Now:yyyy-MM-dd HH:mm:ss}: {sMessage}{Environment.NewLine}";
             File.AppendAllText(_LogFilePath, sLogEntry, Encoding.UTF8);
         }
         catch { }
