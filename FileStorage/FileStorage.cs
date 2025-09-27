@@ -20,13 +20,13 @@ public sealed class FileStorage : IDisposable
 #endif
 {
     private readonly string _StoragePath;
-    private readonly uint _DeleteEveryHours;
+    private readonly uint _DeleteEveryMinutes;
     private readonly ConcurrentDictionary<Guid, int> _ActiveRefs = new ConcurrentDictionary<Guid, int>();
     private Timer _oCleanupTimer;
     private readonly ManualResetEventSlim _CleanupCompleted = new ManualResetEventSlim(true);
     private readonly object _RefsLock = new object();
     private readonly object _IndexLock = new object();
-    private readonly double _FreeSpaceBufferRatio = 0.1;
+    private readonly double _FreeSpaceBufferRatio = 0.1;//در نظر گرفتن ده درصد فضای بیشتر
     private volatile int _CleanupRunning;
     private volatile int _Disposed;
     private static readonly ThreadLocal<Random> _Random = new ThreadLocal<Random>(() => new Random(Guid.NewGuid().GetHashCode()));
@@ -42,7 +42,16 @@ public sealed class FileStorage : IDisposable
     private const int _MaxIndexEntries = 10000;
     private const int _IndexRebuildHours = 24;
     private readonly JsonSerializerSettings _JsonSettings;
-    private readonly uint _MaxActiveRefHours;//حداکثر مهلت به یک فایل برای حذف شدن
+    private readonly uint _MaxActiveRefMinutes;//حداکثر مهلت به یک فایل برای حذف شدن
+    private readonly object _LogRotationLock = new object();
+    // اندازه فعلی فایل لاگ (برای جلوگیری از بررسی مداوم فایل)
+    private long _CurrentLogFileSize = 0;
+    private int _LogEntriesSinceLastCheck = 0;
+    private const long _LogRotationThreshold = 5 * 1024 * 1024;//آستانه حجم لاگ برای بک آپ گرفتن
+    private const int _LogCheckInterval = 100;
+    private int _RotationCount = 0;
+    private readonly int _MaxKeepBackupFile = 5;
+    private readonly int _BackupFileRotationCleanUp = 10;
 #if WEB
     private FileStorageRegisteredObject _oRegisteredObject;
 #endif
@@ -76,7 +85,7 @@ public sealed class FileStorage : IDisposable
             base.Dispose(bDisposing);
         }
     }
-    public FileStorage(string sPath, uint iDeleteEveryHours = 1)
+    public FileStorage(string sPath, uint iDeleteEveryMinute = 60)
     {
         if (string.IsNullOrWhiteSpace(sPath))
             throw new ArgumentNullException(nameof(sPath));
@@ -90,8 +99,28 @@ public sealed class FileStorage : IDisposable
         {
             throw new ArgumentException("Invalid storage path", nameof(sPath), ex);
         }
-        _DeleteEveryHours = iDeleteEveryHours;
-        _MaxActiveRefHours = (uint)(iDeleteEveryHours * 2);
+        try
+        {
+            if (File.Exists(_LogFilePath))
+            {
+                var oFileInfo = new FileInfo(_LogFilePath);
+                Interlocked.Exchange(ref _CurrentLogFileSize, oFileInfo.Length);
+                if (oFileInfo.Length > _LogRotationThreshold)
+                {
+                    CheckAndRotateLog();
+                }
+            }
+            else
+            {
+                Interlocked.Exchange(ref _CurrentLogFileSize, 0);
+            }
+        }
+        catch
+        {
+            Interlocked.Exchange(ref _CurrentLogFileSize, 0);
+        }
+        _DeleteEveryMinutes = iDeleteEveryMinute;
+        _MaxActiveRefMinutes = (uint)(iDeleteEveryMinute * 2);
         Directory.CreateDirectory(_StoragePath);
         _DriveInfo = new DriveInfo(Path.GetPathRoot(_StoragePath));
         _LogFilePath = Path.Combine(_StoragePath, "FileStorageLogs.log");
@@ -112,10 +141,10 @@ public sealed class FileStorage : IDisposable
             HostingEnvironment.RegisterObject(_oRegisteredObject);
         }
 #endif
-        var oDelay = TimeSpan.FromHours(iDeleteEveryHours);
+        var oDelay = TimeSpan.FromMinutes(iDeleteEveryMinute);
         int iMs = (int)Math.Min((long)oDelay.TotalMilliseconds, int.MaxValue);
         _oCleanupTimer = new Timer(OnCleanupTimer, null, 30000, iMs);
-        LogMessage($"FileStorage initialized. Path: {_StoragePath}, Cleanup interval: {iDeleteEveryHours} hours");
+        LogMessage($"FileStorage initialized. Path: {_StoragePath}, Cleanup interval: {iDeleteEveryMinute} minute");
     }
     private void LoadOrRebuildIndex()
     {
@@ -597,9 +626,9 @@ public sealed class FileStorage : IDisposable
             _CleanupCompleted.Set();
             if (_Disposed == 0)
             {
-                int iMs = (int)Math.Min(TimeSpan.FromHours(_DeleteEveryHours).TotalMilliseconds, int.MaxValue);
+                int iMs = (int)Math.Min(TimeSpan.FromMinutes(_DeleteEveryMinutes).TotalMilliseconds, int.MaxValue);
                 _oCleanupTimer?.Change(iMs, iMs);
-                LogMessage($"Cleanup timer reset for next run in {_DeleteEveryHours} hours");
+                LogMessage($"Cleanup timer reset for next run in {_DeleteEveryMinutes} minute");
             }
         }
     }
@@ -609,8 +638,8 @@ public sealed class FileStorage : IDisposable
         {
             LogMessage($"Current system time (UTC): {DateTime.UtcNow}");
             LogMessage($"Current system time (Local): {DateTime.Now}");
-            var dtCutoff = DateTime.UtcNow - TimeSpan.FromHours(_DeleteEveryHours);
-            var dtForceDeleteCutoff = DateTime.UtcNow - TimeSpan.FromHours(_DeleteEveryHours + _MaxActiveRefHours);
+            var dtCutoff = DateTime.UtcNow - TimeSpan.FromMinutes(_DeleteEveryMinutes);
+            var dtForceDeleteCutoff = DateTime.UtcNow - TimeSpan.FromMinutes(_DeleteEveryMinutes + _MaxActiveRefMinutes);
             LogMessage($"Cleanup started. Cutoff time (UTC): {dtCutoff} (Local: {dtCutoff.ToLocalTime()})");
             LogMessage($"Force delete cutoff (UTC): {dtForceDeleteCutoff} (Local: {dtForceDeleteCutoff.ToLocalTime()})");
 
@@ -958,6 +987,13 @@ public sealed class FileStorage : IDisposable
     //}
     private void LogMessage(string sMessage)
     {
+        // محاسبه دقیق اندازه پیام لاگ
+        string sLogEntry = $"UtcTime:{DateTime.UtcNow:yyyy-MM-dd HH:mm:ss}=>LocalTime:{DateTime.Now:yyyy-MM-dd HH:mm:ss}: {sMessage}{Environment.NewLine}";
+        int entrySize = Encoding.UTF8.GetByteCount(sLogEntry);
+        if (Interlocked.Increment(ref _LogEntriesSinceLastCheck) >= _LogCheckInterval)
+        {
+            CheckAndRotateLog();
+        }
         const int iMaxRetries = 2;
         const int iBaseDelayMs = 100;
         void TryLog(int iAttempt)
@@ -966,26 +1002,41 @@ public sealed class FileStorage : IDisposable
                 return;
             try
             {
-                string sLogEntry = $"UtcTime:{DateTime.UtcNow:yyyy-MM-dd HH:mm:ss}=>LocalTime:{DateTime.Now:yyyy-MM-dd HH:mm:ss}: {sMessage}{Environment.NewLine}";
-                File.AppendAllText(_LogFilePath, sLogEntry, Encoding.UTF8);
+                using (var fs = new FileStream(
+                    _LogFilePath,
+                    FileMode.Append,
+                    FileAccess.Write,
+                    FileShare.Read,
+                    bufferSize: 8192,
+                    options: FileOptions.SequentialScan))
+                using (var oWriter = new StreamWriter(fs, Encoding.UTF8))
+                {
+                    oWriter.Write(sLogEntry);
+                    oWriter.Flush();
+                }
+                Interlocked.Add(ref _CurrentLogFileSize, entrySize);
                 return;
             }
             catch (Exception ex)
             {
                 if (iAttempt == iMaxRetries - 1)
                     return;
-                bool bIsFileNotFound = ex is FileNotFoundException || (ex is IOException && ex.Message.Contains("Could not find")) || (ex is IOException && ex.Message.Contains("The system cannot find the file"));
+                bool bIsFileNotFound = ex is FileNotFoundException || (ex is IOException && ex.Message.Contains("Could not find")) ||
+                                      (ex is IOException && ex.Message.Contains("The system cannot find the file"));
+
                 if (bIsFileNotFound)
                 {
                     try
                     {
-                        File.WriteAllText(_LogFilePath, $"Log File Created At UtcTime {DateTime.UtcNow:yyyy-MM-dd HH:mm:ss} LocalTime {DateTime.Now:yyyy-MM-dd HH:mm:ss}{Environment.NewLine}", Encoding.UTF8);
+                        string NewLogHeader = $"Log File Created At UtcTime {DateTime.UtcNow:yyyy-MM-dd HH:mm:ss} LocalTime {DateTime.Now:yyyy-MM-dd HH:mm:ss}{Environment.NewLine}";
+                        File.WriteAllText(_LogFilePath, NewLogHeader, Encoding.UTF8);
+                        // به‌روزرسانی اندازه فایل جدید
+                        Interlocked.Exchange(ref _CurrentLogFileSize, Encoding.UTF8.GetByteCount(NewLogHeader));
                         Thread.Sleep(iBaseDelayMs);
                         TryLog(iAttempt + 1);
                     }
                     catch
                     {
-                        // در صورت شکست در ایجاد فایل، تلاش متوقف می‌شود
                         return;
                     }
                 }
@@ -998,6 +1049,67 @@ public sealed class FileStorage : IDisposable
         }
         TryLog(0);
     }
+    private void CheckAndRotateLog()
+    {
+        Interlocked.Exchange(ref _LogEntriesSinceLastCheck, 0);
+        if (Interlocked.Read(ref _CurrentLogFileSize) < _LogRotationThreshold)
+            return;
+        lock (_LogRotationLock)
+        {
+            if (Interlocked.Read(ref _CurrentLogFileSize) < _LogRotationThreshold)
+                return;
+
+            try
+            {
+                string TimeStamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
+                string BackupFileName = $"FileStorageLogs_{TimeStamp}.log";
+                string BackupFilePath = Path.Combine(_StoragePath, BackupFileName);
+                // انتقال فایل فعلی به بکاپ
+                if (File.Exists(_LogFilePath))
+                {
+                    File.Move(_LogFilePath, BackupFilePath);
+                }
+                // ایجاد فایل لاگ جدید با هدر
+                string newLogHeader = $"Log File Created At UtcTime {DateTime.UtcNow:yyyy-MM-dd HH:mm:ss} LocalTime {DateTime.Now:yyyy-MM-dd HH:mm:ss}{Environment.NewLine}";
+                File.WriteAllText(_LogFilePath, newLogHeader, Encoding.UTF8);
+                Interlocked.Exchange(ref _CurrentLogFileSize, Encoding.UTF8.GetByteCount(newLogHeader));
+                // پاک‌سازی دوره‌ای فایل‌های بکاپ
+                if (Interlocked.Increment(ref _RotationCount) % _BackupFileRotationCleanUp == 0)
+                {
+                    CleanupOldLogBackups();
+                }
+            }
+            catch (Exception oEx)
+            {
+                try
+                {
+                    Debug.WriteLine($"Log rotation failed: {oEx.Message}");
+                }
+                catch {/* نادیده میگیریم*/ }
+            }
+        }
+    }
+    private void CleanupOldLogBackups()
+    {
+        try
+        {
+            var oBackupFiles = new DirectoryInfo(_StoragePath).EnumerateFiles("FileStorageLogs_*.log").OrderBy(f => f.CreationTimeUtc).ToList();
+            while (oBackupFiles.Count > _MaxKeepBackupFile)
+            {
+                var oFileToDelete = oBackupFiles[0];
+                try
+                {
+                    oFileToDelete.Delete();
+                    oBackupFiles.RemoveAt(0);
+                }
+                catch
+                {
+                    oBackupFiles.RemoveAt(0);
+                }
+            }
+        }
+        catch { }
+    }
     public void ForceCleanup()
     {
         OnCleanupTimer(null);
@@ -1005,7 +1117,8 @@ public sealed class FileStorage : IDisposable
     public void ForceCleanupOldFiles(int iHoursAgo = 24)
     {
         var dtCutoff = DateTime.UtcNow - TimeSpan.FromHours(iHoursAgo);
-        var dtForceDeleteCutoff = DateTime.UtcNow - TimeSpan.FromHours(iHoursAgo + _MaxActiveRefHours);
+        //var dtForceDeleteCutoff = DateTime.UtcNow - TimeSpan.FromHours(iHoursAgo + _MaxActiveRefMinute);
+        var dtForceDeleteCutoff = DateTime.UtcNow - TimeSpan.FromHours(iHoursAgo) - TimeSpan.FromMinutes(_MaxActiveRefMinutes);
         LogMessage($"Forced cleanup. Cutoff time (UTC): {dtCutoff}");
         LogMessage($"Force delete cutoff (UTC): {dtForceDeleteCutoff}");
 
@@ -1056,8 +1169,10 @@ public sealed class FileStorage : IDisposable
     }
     public void TestFileDeletion(string sFileId)
     {
-        var dtCutoff = DateTime.UtcNow - TimeSpan.FromHours(_DeleteEveryHours);
-        var dtForceDeleteCutoff = DateTime.UtcNow - TimeSpan.FromHours(_DeleteEveryHours + _MaxActiveRefHours);
+        //var dtCutoff = DateTime.UtcNow - TimeSpan.FromHours(_DeleteEveryMinute);
+        //var dtForceDeleteCutoff = DateTime.UtcNow - TimeSpan.FromHours(_DeleteEveryMinute + _MaxActiveRefMinute);
+        var dtCutoff = DateTime.UtcNow - TimeSpan.FromMinutes(_DeleteEveryMinutes);
+        var dtForceDeleteCutoff = DateTime.UtcNow - TimeSpan.FromMinutes(_DeleteEveryMinutes + _MaxActiveRefMinutes);
         lock (_IndexLock)
         {
             var oEntry = _FileIndex.FirstOrDefault(e => e.FileId == sFileId);
